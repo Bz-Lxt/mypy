@@ -317,8 +317,11 @@ class FineGrainedSuite(DataSuite):
             use_fixme = m.group(1) if m else None
             m = re.match("--max-guesses=([0-9]+)", flags)
             max_guesses = int(m.group(1)) if m else None
+            # A single suggest directive may name several functions, which
+            # are inferred together as a group.
+            targets_list = target.split()
             res: dict[str, Any] = server.cmd_suggest(
-                target.strip(),
+                targets_list,
                 json=json,
                 no_any=no_any,
                 no_errors=no_errors,
@@ -371,9 +374,16 @@ class FineGrainedSuite(DataSuite):
 
     def get_suggest(self, program_text: str, incremental_step: int) -> list[tuple[str, str]]:
         step_bit = "1?" if incremental_step == 1 else str(incremental_step)
-        regex = f"# suggest{step_bit}: (--[a-zA-Z0-9_\\-./=?^ ]+ )*([a-zA-Z0-9_.:/?^ ]+)$"
-        m = re.findall(regex, program_text, flags=re.MULTILINE)
-        return m
+        regex = f"# suggest{step_bit}: (.*)$"
+        result: list[tuple[str, str]] = []
+        for line in re.findall(regex, program_text, flags=re.MULTILINE):
+            # Anything starting with '-' is a flag, the rest are targets.
+            # Several targets mean that signatures are inferred as a group.
+            tokens = line.split()
+            flags = " ".join(token for token in tokens if token.startswith("-"))
+            targets = " ".join(token for token in tokens if not token.startswith("-"))
+            result.append((flags, targets))
+        return result
 
     def get_inspect(self, program_text: str, incremental_step: int) -> list[tuple[str, str]]:
         step_bit = "1?" if incremental_step == 1 else str(incremental_step)

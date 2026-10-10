@@ -168,7 +168,8 @@ Static inference of annotations
 *******************************
 
 The mypy daemon supports (as an experimental feature) statically inferring
-draft function and method type annotations. Use ``dmypy suggest FUNCTION`` to
+draft function and method type annotations. Use ``dmypy suggest FUNCTION`` (or
+``dmypy suggest FUNCTION FUNCTION ...`` for a group of related functions) to
 generate a draft signature in the format
 ``(param_type_1, param_type_2, ...) -> ret_type`` (types are included for all
 arguments, including keyword-only arguments, ``*args`` and ``**kwargs``).
@@ -202,6 +203,20 @@ More generally, the target function may be specified in two ways:
 
 This command can also be used to find a more precise alternative for an existing,
 imprecise annotation with some ``Any`` types.
+
+You can also pass several functions at once, for example
+``dmypy suggest package.module.foo package.other.bar``. The signatures are
+then inferred jointly for the whole group, which is needed for functions that
+call each other (including across modules) or that are mutually recursive:
+guessing each signature separately would miss the information flowing through
+those calls. The functions may be listed in any order -- duplicate targets are
+ignored and the output order is fixed. Each suggested line is prefixed with the
+function name, and ``--json`` returns a single array containing an entry for
+every function. If a complete, consistent set of signatures cannot be found
+(for example with ``--no-any`` when some type can't be inferred), the command
+reports an error and returns no suggestions rather than a partial result. The
+daemon's checked state is always restored afterwards, so a group suggestion
+never affects later checks.
 
 The following flags customize various aspects of the ``dmypy suggest``
 command.

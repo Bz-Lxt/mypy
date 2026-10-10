@@ -28,7 +28,7 @@ import itertools
 import json
 import os
 import sys
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Collection, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from typing import NamedTuple, TypedDict, TypeVar, cast
 
@@ -98,32 +98,38 @@ class Callsite(NamedTuple):
     arg_types: list[list[Type]]
 
 
+def normalize_suggestion_target(fullname: str) -> str:
+    """Map __new__/__init__ target names onto the class name, as hooks see it."""
+    if fullname.endswith((".__new__", ".__init__")):
+        return fullname.rsplit(".", 1)[0]
+    return fullname
+
+
 class SuggestionPlugin(Plugin):
-    """Plugin that records all calls to a given target."""
+    """Plugin that records all calls to the given target(s)."""
 
-    def __init__(self, target: str) -> None:
-        if target.endswith((".__new__", ".__init__")):
-            target = target.rsplit(".", 1)[0]
-
-        self.target = target
-        # List of call sites found by dmypy suggest:
+    def __init__(self, targets: str | Collection[str]) -> None:
+        if isinstance(targets, str):
+            targets = [targets]
+        self.targets = {normalize_suggestion_target(target) for target in targets}
+        # Call sites found by dmypy suggest, keyed by callee fullname:
         # (path, line, <arg kinds>, <arg names>, <arg types>)
-        self.mystery_hits: list[Callsite] = []
+        self.mystery_hits: dict[str, list[Callsite]] = {target: [] for target in self.targets}
 
     def get_function_hook(self, fullname: str) -> Callable[[FunctionContext], Type] | None:
-        if fullname == self.target:
-            return self.log
+        if fullname in self.targets:
+            return lambda ctx: self.log(fullname, ctx)
         else:
             return None
 
     def get_method_hook(self, fullname: str) -> Callable[[MethodContext], Type] | None:
-        if fullname == self.target:
-            return self.log
+        if fullname in self.targets:
+            return lambda ctx: self.log(fullname, ctx)
         else:
             return None
 
-    def log(self, ctx: FunctionContext | MethodContext) -> Type:
-        self.mystery_hits.append(
+    def log(self, fullname: str, ctx: FunctionContext | MethodContext) -> Type:
+        self.mystery_hits[fullname].append(
             Callsite(
                 ctx.api.path,
                 ctx.context.line,
@@ -215,6 +221,12 @@ class SuggestionFailure(Exception):
     pass
 
 
+# Maximum number of joint refinement rounds for a group of mutually
+# recursive functions before we give up and report a failure instead of
+# returning a shaky, non-stabilized result.
+MAX_GROUP_ITERATIONS = 10
+
+
 def is_explicit_any(typ: AnyType) -> bool:
     # Originally I wanted to count as explicit anything derived from an explicit any, but that
     # seemed too strict in some testing.
@@ -271,44 +283,79 @@ class SuggestionEngine:
         self.max_guesses = max_guesses or 64
         self.use_fixme = use_fixme
 
-    def suggest(self, function: str) -> str:
-        """Suggest an inferred type for function."""
-        mod, func_name, node = self.find_node(function)
+    def suggest(self, functions: str | Sequence[str]) -> str:
+        """Suggest inferred types for one or more functions.
 
-        with self.restore_after(mod):
+        When several functions are given, they are inferred together as a
+        group, so that mutually recursive and cross-module callers get
+        concrete types that hold jointly, rather than guessing each
+        signature in isolation.
+        """
+        targets = self.find_nodes(functions)
+        modules = {mod for mod, _, _ in targets}
+
+        with self.restore_after(modules):
             with self.with_export_types():
-                suggestion = self.get_suggestion(mod, node)
+                if len(targets) == 1:
+                    mod, func_name, node = targets[0]
+                    suggestion = self.get_suggestion(mod, node)
+                    if self.give_json:
+                        return self.json_suggestion(mod, func_name, node, suggestion)
+                    return self.format_signature(suggestion)
 
-        if self.give_json:
-            return self.json_suggestion(mod, func_name, node, suggestion)
-        else:
-            return self.format_signature(suggestion)
+                suggestions = self.get_suggestions(targets)
+                if self.give_json:
+                    objs = [
+                        self.json_suggestion_obj(mod, func_name, node, suggestion)
+                        for (mod, func_name, node), suggestion in zip(targets, suggestions)
+                    ]
+                    # The output must not depend on the order in which targets were given.
+                    objs.sort(key=lambda o: (o["path"], o["line"], o["func_name"]))
+                    return json.dumps(objs, sort_keys=True)
+                return "\n".join(
+                    f"{func_name}: {self.format_signature(suggestion)}"
+                    for (_, func_name, _), suggestion in zip(targets, suggestions)
+                )
 
-    def suggest_callsites(self, function: str) -> str:
-        """Find a list of call sites of function."""
-        mod, _, node = self.find_node(function)
-        with self.restore_after(mod):
-            callsites, _ = self.get_callsites(node)
+    def suggest_callsites(self, functions: str | Sequence[str]) -> str:
+        """Find a list of call sites of one or more functions."""
+        targets = self.find_nodes(functions)
+        modules = {mod for mod, _, _ in targets}
+        multi = len(targets) > 1
+        with self.restore_after(modules):
+            blocks: list[str] = []
+            for mod, func_name, node in targets:
+                callsites, _ = self.get_callsites(node)
+                lines = dedup(
+                    [
+                        f"{path}:{line}: {self.format_args(arg_kinds, arg_names, arg_types)}"
+                        for path, line, arg_kinds, _, arg_names, arg_types in callsites
+                    ]
+                )
+                if multi:
+                    blocks.extend(f"{func_name}: {line_str}" for line_str in lines)
+                else:
+                    blocks.extend(lines)
 
-        return "\n".join(
-            dedup(
-                [
-                    f"{path}:{line}: {self.format_args(arg_kinds, arg_names, arg_types)}"
-                    for path, line, arg_kinds, _, arg_names, arg_types in callsites
-                ]
-            )
-        )
+        return "\n".join(blocks)
 
     @contextmanager
-    def restore_after(self, module: str) -> Iterator[None]:
-        """Context manager that reloads a module after executing the body.
+    def restore_after(self, modules: str | Iterable[str]) -> Iterator[None]:
+        """Context manager that reloads modules after executing the body.
 
-        This should undo any damage done to the module state while mucking around.
+        This should undo any damage done to the module state while mucking
+        around. Every module touched by the body is reloaded, so that the
+        checked state of a daemon session is left unchanged even when a
+        suggestion spans several modules.
         """
+        if isinstance(modules, str):
+            modules = [modules]
+        module_list = sorted(set(modules))
         try:
             yield
         finally:
-            self.reload(self.graph[module])
+            for module in module_list:
+                self.reload(self.graph[module])
 
     @contextmanager
     def with_export_types(self) -> Iterator[None]:
@@ -432,7 +479,30 @@ class SuggestionEngine:
         finally:
             self.plugin._plugins.pop(0)
 
-        return collector_plugin.mystery_hits, errors
+        target = normalize_suggestion_target(func.fullname)
+        return collector_plugin.mystery_hits[target], errors
+
+    def get_group_callsites(
+        self, func: FuncDef, nodes: Sequence[FuncDef], types: dict[FuncDef, CallableType]
+    ) -> tuple[list[Callsite], list[str]]:
+        """Find all call sites of func while the whole group is rechecked.
+
+        Assumes the starting (all-Any) type for func and the currently
+        guessed types for the rest of the group, then rechecks everything
+        together in one update so that calls within the group are seen.
+        """
+        collector_plugin = SuggestionPlugin([node.fullname for node in nodes])
+
+        self.plugin._plugins.insert(0, collector_plugin)
+        try:
+            assumed = dict(types)
+            assumed[func] = self.get_starting_type(func)
+            errors = self.try_types(assumed)
+        finally:
+            self.plugin._plugins.pop(0)
+
+        target = normalize_suggestion_target(func.fullname)
+        return collector_plugin.mystery_hits[target], errors
 
     def filter_options(
         self, guesses: list[CallableType], is_method: bool, ignore_return: bool
@@ -519,6 +589,132 @@ class SuggestionEngine:
 
         return self.pyannotate_signature(mod, is_method, best)
 
+    def get_suggestions(
+        self, targets: list[tuple[str, str, FuncDef]]
+    ) -> list[PyAnnotateSignature]:
+        """Compute jointly consistent suggestions for a group of functions.
+
+        The functions are refined together using Jacobi-style fixed point
+        iteration: in each round every function is re-guessed against the
+        types the rest of the group had at the *start* of the round. This
+        makes the outcome independent of the order in which the functions
+        were supplied. A result is returned only if every function gets a
+        complete signature and the whole group stabilizes, otherwise
+        SuggestionFailure is raised and no partial suggestions are given.
+        """
+        nodes = [node for _, _, node in targets]
+        is_methods = {node: bool(node.info) and node.has_self_or_cls_argument for node in nodes}
+        defaults = {node: self.get_default_arg_types(node) for node in nodes}
+        starting = {node: self.get_starting_type(node) for node in nodes}
+        current = dict(starting)
+
+        # Sanity check the group with all-trivial types, like get_suggestion does.
+        _, orig_errors = self.get_group_callsites(nodes[0], nodes, current)
+        if self.no_errors and orig_errors:
+            raise SuggestionFailure("Function does not typecheck.")
+
+        for _ in range(MAX_GROUP_ITERATIONS):
+            next_types = dict(current)
+            for mod, _, node in targets:
+                callsites, _ = self.get_group_callsites(node, nodes, current)
+                uses = get_arg_uses(self.manager.all_types, node)
+
+                with state.strict_optional_set(self.graph[mod].options.strict_optional):
+                    guesses = self.get_guesses(
+                        is_methods[node], starting[node], defaults[node], callsites, uses
+                    )
+                guesses += self.get_guesses_from_parent(node)
+                guesses = self.filter_options(guesses, is_methods[node], ignore_return=True)
+                # Keep the all-Any starting type as a (losing) candidate, so
+                # that a function with no known call sites stays an inert
+                # suggestion-engine Any instead of an explicit Any. Explicit
+                # Any would leak into the other functions' call sites and
+                # poison their guesses during later rounds.
+                guesses.insert(0, starting[node])
+                best, _ = self.find_best_in_group(node, guesses, nodes, current)
+
+                # Now try to find the return type!
+                self.try_types(self.group_assumptions(node, best, nodes, current))
+                returns = get_return_types(self.manager.all_types, node)
+                with state.strict_optional_set(self.graph[mod].options.strict_optional):
+                    if returns:
+                        ret_types = generate_type_combinations(returns)
+                    else:
+                        ret_types = [NoneType()]
+
+                guesses = [
+                    best.copy_modified(ret_type=refine_type(best.ret_type, t)) for t in ret_types
+                ]
+                guesses = self.filter_options(guesses, is_methods[node], ignore_return=False)
+                best, _ = self.find_best_in_group(node, guesses, nodes, current)
+                next_types[node] = best
+
+            if all(next_types[node] == current[node] for node in nodes):
+                current = next_types
+                break
+            current = next_types
+        else:
+            raise SuggestionFailure(
+                f"Could not find stable signatures for the group after "
+                f"{MAX_GROUP_ITERATIONS} iterations"
+            )
+
+        # Turn the inert suggestion-engine Anys (placeholders for positions
+        # we never learned anything about) into ordinary explicit Anys, then
+        # enforce the Any/error filters on the finalized signatures. If any
+        # member fails the filters, the whole group fails rather than handing
+        # back a partial or disallowed result.
+        finalized: dict[FuncDef, CallableType] = {
+            node: cast(CallableType, current[node].accept(MakeExplicitAny())) for node in nodes
+        }
+        for node in nodes:
+            accepted = self.filter_options(
+                [finalized[node]], is_methods[node], ignore_return=False
+            )
+            if not accepted:
+                raise SuggestionFailure("No guesses that match criteria!")
+
+        final_errors = self.try_types(finalized)
+        if self.no_errors and count_errors(final_errors):
+            raise SuggestionFailure("No annotations without errors")
+
+        return [
+            self.pyannotate_signature(mod, is_methods[node], finalized[node])
+            for mod, _, node in targets
+        ]
+
+    def group_assumptions(
+        self,
+        node: FuncDef,
+        typ: CallableType,
+        nodes: Sequence[FuncDef],
+        current: dict[FuncDef, CallableType],
+    ) -> dict[FuncDef, CallableType]:
+        """Build the type map for a group wave with node assumed to be typ."""
+        return {other: typ if other is node else current[other] for other in nodes}
+
+    def find_best_in_group(
+        self,
+        node: FuncDef,
+        guesses: list[CallableType],
+        nodes: Sequence[FuncDef],
+        current: dict[FuncDef, CallableType],
+    ) -> tuple[CallableType, int]:
+        """Pick the best guess for node, counting errors over the whole group.
+
+        Every candidate is tried in a joint recheck, so a type is selected
+        only if it is compatible with the assumed signatures of all the
+        other functions in the group.
+        """
+        if not guesses:
+            raise SuggestionFailure("No guesses that match criteria!")
+        errors = {
+            guess: self.try_types(self.group_assumptions(node, guess, nodes, current))
+            for guess in guesses
+        }
+        best = min(guesses, key=lambda s: (count_errors(errors[s]), self.score_callable(s)))
+        return best, count_errors(errors[best])
+
     def format_args(
         self,
         arg_kinds: list[list[ArgKind]],
@@ -582,6 +778,23 @@ class SuggestionEngine:
             raise SuggestionFailure(f"Object {key} is not a function")
 
         return modname, tail, node
+
+    def find_nodes(self, keys: str | Sequence[str]) -> list[tuple[str, str, FuncDef]]:
+        """Resolve target keys to (module, tail, func def), deduped and sorted.
+
+        Duplicate references to the same function are collapsed, and the
+        resulting order is canonical, so that every later result is
+        independent of the order in which the targets were supplied.
+        """
+        if isinstance(keys, str):
+            keys = [keys]
+        if not keys:
+            raise SuggestionFailure("No functions specified")
+        targets: dict[tuple[str, str], tuple[str, str, FuncDef]] = {}
+        for key in keys:
+            mod, tail, node = self.find_node(key)
+            targets.setdefault((mod, node.fullname), (mod, tail, node))
+        return sorted(targets.values(), key=lambda target: (target[0], target[1]))
 
     def find_node_by_module_and_name(self, modname: str, tail: str) -> SymbolNode | None:
         """Find symbol node by module id and qualified name.
@@ -703,6 +916,28 @@ class SuggestionEngine:
         finally:
             func.unanalyzed_type = old
 
+    def try_types(self, types: dict[FuncDef, CallableType]) -> list[str]:
+        """Recheck a group of functions together while assuming their types.
+
+        All functions are reprocessed in a single update, so mutually
+        recursive calls are checked against the simultaneously assumed
+        signatures rather than against stale, separately guessed ones.
+
+        Return all error messages.
+        """
+        # During reprocessing, unanalyzed_type gets copied to type (by aststrip).
+        # We set type to None to ensure that the type always changes during
+        # reprocessing.
+        olds = {func: func.unanalyzed_type for func in types}
+        for func, typ in types.items():
+            func.type = None
+            func.unanalyzed_type = typ
+        try:
+            return self.fgmanager.trigger([func.fullname for func in types])
+        finally:
+            for func, old in olds.items():
+                func.unanalyzed_type = old
+
     def reload(self, state: State) -> list[str]:
         """Recheck the module given by state."""
         assert state.path is not None
@@ -723,6 +958,13 @@ class SuggestionEngine:
         self, mod: str, func_name: str, node: FuncDef, suggestion: PyAnnotateSignature
     ) -> str:
         """Produce a json blob for a suggestion suitable for application by pyannotate."""
+        obj = self.json_suggestion_obj(mod, func_name, node, suggestion)
+        return json.dumps([obj], sort_keys=True)
+
+    def json_suggestion_obj(
+        self, mod: str, func_name: str, node: FuncDef, suggestion: PyAnnotateSignature
+    ) -> dict[str, object]:
+        """Build a pyannotate-compatible dict for one suggestion."""
         # pyannotate irritatingly drops class names for class and static methods
         if node.is_class or node.is_static:
             func_name = func_name.split(".", 1)[-1]
@@ -732,14 +974,13 @@ class SuggestionEngine:
         # paths because it is simpler.
         path = os.path.abspath(self.graph[mod].xpath)
 
-        obj = {
+        return {
             "signature": suggestion,
             "line": node.line,
             "path": path,
             "func_name": func_name,
             "samples": 0,
         }
-        return json.dumps([obj], sort_keys=True)
 
     def pyannotate_signature(
         self, cur_module: str | None, is_method: bool, typ: CallableType
@@ -926,6 +1167,25 @@ class MakeSuggestionAny(TypeTranslator):
     def visit_any(self, t: AnyType) -> Type:
         if not t.missing_import_name:
             return t.copy_modified(type_of_any=TypeOfAny.suggestion_engine)
+        else:
+            return t
+
+    def visit_type_alias_type(self, t: TypeAliasType) -> Type:
+        return t.copy_modified(args=[a.accept(self) for a in t.args])
+
+
+class MakeExplicitAny(TypeTranslator):
+    """Turn suggestion-engine placeholder Anys into ordinary explicit Anys.
+
+    This is used to finalize a group suggestion: positions that could not be
+    inferred were carried around as suggestion-engine Anys (which are ignored
+    during constraint solving and callsite collection), but they must show up
+    as plain Anys in the result and count against the Any filters.
+    """
+
+    def visit_any(self, t: AnyType) -> Type:
+        if t.type_of_any == TypeOfAny.suggestion_engine and not t.missing_import_name:
+            return t.copy_modified(type_of_any=TypeOfAny.explicit)
         else:
             return t
 

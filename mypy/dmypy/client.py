@@ -140,13 +140,18 @@ p.add_argument(
 p.add_argument("--remove", metavar="FILE", nargs="*", help="Files to remove from the run")
 
 suggest_parser = p = subparsers.add_parser(
-    "suggest", help="Suggest a signature or show call sites for a specific function"
+    "suggest", help="Suggest a signature for one or more functions, or show their call sites"
 )
 p.add_argument(
     "function",
     metavar="FUNCTION",
     type=str,
-    help="Function specified as '[package.]module.[class.]function'",
+    nargs="+",
+    help=(
+        "Function(s) specified as '[package.]module.[class.]function'. When several "
+        "functions are given, mutually consistent signatures are inferred jointly "
+        "for the whole group, regardless of the order they are listed in"
+    ),
 )
 p.add_argument(
     "--json",
@@ -512,7 +517,7 @@ def do_suggest(args: argparse.Namespace) -> None:
     response = request(
         args.status_file,
         "suggest",
-        function=args.function,
+        functions=args.function,
         json=args.json,
         callsites=args.callsites,
         no_errors=args.no_errors,

@@ -118,7 +118,7 @@ import os
 import re
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from typing import Final, NamedTuple, TypeAlias as _TypeAlias
 
 from mypy.build import (
@@ -304,11 +304,19 @@ class FineGrainedBuildManager:
         self.previous_messages = messages.copy()
         return messages
 
-    def trigger(self, target: str) -> list[str]:
-        """Trigger a specific target explicitly.
+    def trigger(self, targets: str | Collection[str]) -> list[str]:
+        """Trigger one or more specific targets explicitly.
+
+        All targets are reprocessed in a single update, so this can be used
+        to type check a group of mutually recursive functions under
+        simultaneously assumed types.
 
         This is intended for use by the suggestions engine.
         """
+        if isinstance(targets, str):
+            target_set = {targets}
+        else:
+            target_set = set(targets)
         self.manager.errors.reset()
         changed_modules = propagate_changes_using_dependencies(
             self.manager,
@@ -316,7 +324,7 @@ class FineGrainedBuildManager:
             self.deps,
             set(),
             set(),
-            self.previous_targets_with_errors | {target},
+            self.previous_targets_with_errors | target_set,
             [],
         )
         # Preserve state needed for the next update.

@@ -982,8 +982,10 @@ class Server:
             result["out"] += "\n"
         return result
 
-    def cmd_suggest(self, function: str, callsites: bool, **kwargs: Any) -> dict[str, object]:
-        """Suggest a signature for a function."""
+    def cmd_suggest(
+        self, functions: str | list[str], callsites: bool, **kwargs: Any
+    ) -> dict[str, object]:
+        """Suggest a signature for one or more functions."""
         if not self.fine_grained_manager:
             return {
                 "error": "Command 'suggest' is only valid after a 'check' command"
@@ -992,9 +994,9 @@ class Server:
         engine = SuggestionEngine(self.fine_grained_manager, **kwargs)
         try:
             if callsites:
-                out = engine.suggest_callsites(function)
+                out = engine.suggest_callsites(functions)
             else:
-                out = engine.suggest(function)
+                out = engine.suggest(functions)
         except SuggestionFailure as err:
             return {"error": str(err)}
         else:

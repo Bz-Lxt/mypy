@@ -1268,3 +1268,93 @@ optional5(None)
 [out]
 (int | None) -> None
 ==
+
+[case testSuggestInferGroup]
+# suggest: a.f a.g
+# suggest: a.g a.f
+[file a.py]
+def f(x):
+    g(x)
+def g(x):
+    f(x)
+[file b.py]
+from a import f
+def b() -> None:
+    f(1)
+[out]
+f: (int) -> None
+g: (int) -> None
+f: (int) -> None
+g: (int) -> None
+==
+
+[case testSuggestInferGroupCrossModule]
+# suggest: a.f b.g
+# suggest: b.g a.f
+[file a.py]
+from b import g
+def f(x):
+    g(x)
+[file b.py]
+from a import f
+def g(x):
+    f(x)
+[file c.py]
+from a import f
+def c() -> None:
+    f(1)
+[out]
+f: (int) -> None
+g: (int) -> None
+f: (int) -> None
+g: (int) -> None
+==
+
+[case testSuggestInferGroupNoAnyFailure]
+# suggest: --no-any a.f a.g
+[file a.py]
+def f(x):
+    return x.attr
+def g(x):
+    pass
+[file b.py]
+from a import g
+def b() -> None:
+    g(None)
+[out]
+No guesses that match criteria!
+==
+
+[case testSuggestInferGroupJson]
+# suggest: --json a.f a.g
+[file a.py]
+def f(x):
+    g(x)
+def g(x):
+    f(x)
+[file b.py]
+from a import f
+def b() -> None:
+    f(1)
+[out]
+\[{"func_name": "f", "line": 1, "path": "tmp/a.py", "samples": 0, "signature": {"arg_types": ["int"], "return_type": "None"}}, {"func_name": "g", "line": 3, "path": "tmp/a.py", "samples": 0, "signature": {"arg_types": ["int"], "return_type": "None"}}]
+==
+
+[case testSuggestCallsitesGroup]
+# suggest: --callsites a.f a.g
+[file a.py]
+def f(x):
+    g(x)
+def g(x):
+    f(x)
+[file b.py]
+from a import f, g
+def b() -> None:
+    f(1)
+    f('x')
+    g(True)
+[out]
+f: tmp/b.py:3: (int)
+f: tmp/b.py:4: (str)
+g: tmp/b.py:5: (bool)
+==
