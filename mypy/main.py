@@ -97,6 +97,9 @@ def main(
         stdout, stderr, options.hide_error_codes, hide_success=bool(options.output)
     )
 
+    if options.max_function_work < 0:
+        fail("error: --max-function-work must be a non-negative integer", stderr, options)
+
     if options.num_workers:
         # Supporting both parsers would be really tricky, so just support the new one.
         options.native_parser = True
@@ -1192,6 +1195,17 @@ def define_options(
         type=int,
         default=0,
         help="Number of separate mypy worker processes (experimental)",
+    )
+
+    internals_group.add_argument(
+        "--max-function-work",
+        type=int,
+        default=0,
+        metavar="LIMIT",
+        help="Maximum amount of type checking work per function (deterministic work "
+        "units). If checking a function requires more work, it is reported as not "
+        "fully checked and mypy continues with other functions. The default of 0 "
+        "means no limit.",
     )
 
     report_group = parser.add_argument_group(

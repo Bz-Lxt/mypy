@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Final, TypeGuard, cast
 import mypy.subtypes
 import mypy.typeops
 from mypy.argmap import ArgTypeExpander
+from mypy.checker_state import checker_state
 from mypy.erasetype import erase_typevars
 from mypy.expandtype import expand_type_by_instance
 from mypy.maptype import map_instance_to_supertype
@@ -304,6 +305,10 @@ def infer_constraints(
     then skip adding reverse (polymorphic) constraints (since this is already a call
     to infer such constraints).
     """
+    # Account for a deterministic unit of recursive constraint inference.
+    type_checker = checker_state.type_checker
+    if type_checker is not None:
+        type_checker.charge_work()
     if any(
         get_proper_type(template) == get_proper_type(t)
         and get_proper_type(actual) == get_proper_type(a)
@@ -317,7 +322,11 @@ def infer_constraints(
             # Return early on an empty branch.
             return []
         type_state.inferring.append((template, actual))
-        res = _infer_constraints(template, actual, direction, skip_neg_op, erase_types)
+        try:
+            res = _infer_constraints(template, actual, direction, skip_neg_op, erase_types)
+        except BaseException:
+            type_state.inferring.pop()
+            raise
         type_state.inferring.pop()
         return res
     return _infer_constraints(template, actual, direction, skip_neg_op, erase_types)

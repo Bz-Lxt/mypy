@@ -1312,6 +1312,31 @@ pass
 error: Cache must be enabled in parallel mode
 == Return code: 2
 
+[case testParallelRunWithExhaustedFunctionWorkLimitFails]
+# cmd: mypy a.py --num-workers=2 --max-function-work=50
+# A build where a function exhausts its work limit is not a successful
+# complete check, even in parallel mode: the incomplete function is reported
+# and the process exits with a non-success status.
+[file a.py]
+from typing import Generic, TypeVar, Union
+T = TypeVar("T")
+class Box(Generic[T]):
+    def __init__(self, x: T) -> None:
+        self.x = x
+def heavy(u: Union[int, str, None]) -> None:
+    a = Box(u)
+    b = Box(a)
+    c = Box(b)
+    d = Box(c)
+    e = Box(d)
+    f = Box(e)
+def later_bad(x: int) -> str:
+    return x
+[out]
+a.py:6: error: Function "heavy" was not fully type checked: exceeded the configured per-function work limit of 50 work units
+a.py:6: note: This function contains overly complex type inference (e.g. deeply nested or recursive generics). Simplify it, or increase the limit using --max-function-work (0 means no limit)
+a.py:14: error: Incompatible return value type (got "int", expected "str")
+
 [case testCheckingStubPackagesWorksInParallelMode]
 # cmd: mypy foo-stubs --num-workers=4
 [file foo-stubs/__init__.pyi]

@@ -243,7 +243,9 @@ class TypeCheckSuite(DataSuite):
 
         if res:
             if options.cache_dir != os.devnull:
-                self.verify_cache(module_data, res.manager, blocker, incremental_step)
+                self.verify_cache(
+                    module_data, res.manager, blocker, incremental_step, res.graph
+                )
 
             name = "targets"
             if incremental_step:
@@ -280,14 +282,21 @@ class TypeCheckSuite(DataSuite):
         manager: build.BuildManager,
         blocker: bool,
         step: int,
+        graph: build.Graph,
     ) -> None:
         if not blocker:
             # There should be valid cache metadata for each module except
             # in case of a blocking error in themselves or one of their
-            # dependencies.
+            # dependencies, or when their per-function work limit was
+            # exhausted (such modules are intentionally not cached).
             modules = self.find_module_files(manager)
             modules.update({module_name: path for module_name, path, text in module_data})
-            missing_paths = self.find_missing_cache_files(modules, manager)
+            incomplete_paths = {
+                state.path
+                for state in graph.values()
+                if state.path and state.num_incomplete_functions()
+            }
+            missing_paths = self.find_missing_cache_files(modules, manager) - incomplete_paths
             if missing_paths:
                 raise AssertionError(f"cache data missing for {missing_paths} on run {step}")
         assert os.path.isfile(os.path.join(manager.options.cache_dir, ".gitignore"))

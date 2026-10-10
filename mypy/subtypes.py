@@ -295,6 +295,12 @@ def is_same_type(
 def _is_subtype(
     left: Type, right: Type, subtype_context: SubtypeContext, proper_subtype: bool
 ) -> bool:
+    # Account for a deterministic unit of structural subtyping work. Union
+    # expansion re-enters the public is_subtype() entry per item, so each
+    # expanded comparison is metered as well.
+    type_checker = checker_state.type_checker
+    if type_checker is not None:
+        type_checker.charge_work()
     subtype_context.check_context(proper_subtype)
     orig_right = right
     orig_left = left

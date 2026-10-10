@@ -871,6 +871,9 @@ class BuildManager:
         modules_state.node_fixer = NodeFixer(self.modules, self.options.use_fine_grained_cache)
         self.import_map: dict[str, set[str]] = {}
         self.missing_modules: dict[str, int] = {}
+        # Total number of functions that exhausted their per-function work limit.
+        # A build with any such function is not a successful complete check.
+        self.incomplete_functions = 0
         self.fg_deps_meta: dict[str, FgDepMeta] = {}
         # fg_deps holds the dependencies of every module that has been
         # processed. We store this in BuildManager so that we can compute
@@ -2899,6 +2902,10 @@ class State:
         self.per_line_checking_time_ns = collections.defaultdict(int)
         self.early_errors = []
         self._type_checker = None
+        # Number of functions that exhausted their per-function work limit in
+        # this module, accumulated across checking passes. Survives checker
+        # teardown (free_state()), unlike the checker-side counter.
+        self.incomplete_functions = 0
         self.add_ancestors()
         self.imports_ignored = imports_ignored
         self.size_hint = size_hint
@@ -3519,8 +3526,18 @@ class State:
                 self.tree.defs.clear()
         self.time_spent_us += time_spent_us(t0)
 
+    def num_incomplete_functions(self) -> int:
+        """Number of functions not fully checked, across finished and active passes."""
+        total = self.incomplete_functions
+        if self._type_checker is not None:
+            total += len(self._type_checker.incomplete_functions)
+        return total
+
     def free_state(self) -> None:
         if self._type_checker:
+            # Preserve the incomplete-function status past checker teardown,
+            # so cache writing and parallel results still see it.
+            self.incomplete_functions += len(self._type_checker.incomplete_functions)
             self._type_checker.reset()
             self._type_checker = None
 
@@ -3583,6 +3600,18 @@ class State:
 
     def write_cache(self) -> tuple[CacheMeta, str] | None:
         assert self.tree is not None, "Internal error: method must be called on parsed file only"
+        # A module whose per-function work limit was exhausted was only checked
+        # partially. Never persist its results as a reusable cache, otherwise a
+        # subsequent run (including one with the limit removed) could silently
+        # reuse partial inference or miss the "not fully checked" diagnostic.
+        num_incomplete = self.num_incomplete_functions()
+        if num_incomplete:
+            self.manager.log(
+                f"Not writing cache for {self.id} because {num_incomplete} "
+                f"function(s) were not fully checked"
+            )
+            self._invalidate_cache_files()
+            return None
         # We don't support writing cache files in fine-grained incremental mode.
         if (
             not self.path
@@ -3630,6 +3659,20 @@ class State:
             self.mark_interface_stale()
             self.interface_hash = new_interface_hash
         return meta_tuple
+
+    def _invalidate_cache_files(self) -> None:
+        """Best-effort removal of this module's stale cache artifacts.
+
+        Used when the module was not fully checked, so that the next run finds
+        no cache and rechecks the module completely from source.
+        """
+        meta_file, data_file, _ = get_cache_names(self.id, self.path, self.options)
+        for filename in (data_file, meta_file, get_meta_ex_name(meta_file)):
+            try:
+                self.manager.metastore.remove(filename)
+            except OSError:
+                pass
+        self.manager.commit_module(meta_file)
 
     def verify_dependencies(self, suppressed_only: bool = False) -> None:
         """Report errors for import targets in modules that don't exist.
@@ -4630,6 +4673,9 @@ def process_graph(graph: Graph, manager: BuildManager) -> None:
                         graph[id].mark_interface_stale()
                         graph[id].interface_hash = new_hash
                 else:
+                    if result.incomplete_functions:
+                        manager.incomplete_functions += result.incomplete_functions
+                        graph[id].incomplete_functions += result.incomplete_functions
                     manager.flush_errors(
                         manager.errors.simplify_path(graph[id].xpath), result.error_lines, False
                     )
@@ -4809,6 +4855,9 @@ def process_stale_scc(graph: Graph, ascc: SCC, manager: BuildManager) -> None:
         graph[id].generate_unused_ignore_notes()
         graph[id].generate_ignore_without_code_notes()
 
+    for id in stale:
+        manager.incomplete_functions += graph[id].num_incomplete_functions()
+
     t4 = time.time()
     # Flush errors, and write cache in two phases: first data files, then meta files.
     # The two-phase structure is needed because meta.dep_hashes references interface_hash
@@ -4978,6 +5027,21 @@ def process_stale_scc_implementation(
     scc_result = {}
     for id, meta_file in zip(stale, meta_files):
         state = graph[id]
+        num_incomplete = state.num_incomplete_functions()
+        if num_incomplete:
+            # The module was only partially checked. Drop all cache artifacts
+            # (including the interface cache written in the previous phase) so
+            # that the next run rechecks it completely from source, and report
+            # the incomplete status explicitly back to the coordinator.
+            state._invalidate_cache_files()
+            formatted: list[str] = []
+            if graph[id].xpath not in manager.errors.ignored_files:
+                errors = manager.errors.file_messages(graph[id].xpath)
+                formatted = manager.errors.format_messages(
+                    graph[id].xpath, errors, formatter=manager.error_formatter
+                )
+            scc_result[id] = ModuleResult(None, formatted, num_incomplete)
+            continue
         indirect = [dep for dep in state.dependencies if state.priorities.get(dep) == PRI_INDIRECT]
         meta_ex = CacheMetaEx(
             dependencies=indirect,
@@ -5266,17 +5330,29 @@ class ModuleResult:
     includes errors encountered during both phases).
     """
 
-    def __init__(self, interface_hash: str | None, error_lines: list[str]) -> None:
+    def __init__(
+        self,
+        interface_hash: str | None,
+        error_lines: list[str],
+        incomplete_functions: int = 0,
+    ) -> None:
         self.interface_hash = interface_hash
         self.error_lines = error_lines
+        # Number of functions whose per-function work limit was exhausted. Such
+        # modules are not fully checked and must neither be cached nor make the
+        # overall build a success.
+        self.incomplete_functions = incomplete_functions
 
     @classmethod
     def read(cls, buf: ReadBuffer) -> ModuleResult:
-        return ModuleResult(read_str_opt(buf), read_str_list(buf))
+        return ModuleResult(
+            read_str_opt(buf), read_str_list(buf), read_int_bare(buf)
+        )
 
     def write(self, buf: WriteBuffer) -> None:
         write_str_opt(buf, self.interface_hash)
         write_str_list(buf, self.error_lines)
+        write_int_bare(buf, self.incomplete_functions)
 
 
 class SccResponseMessage(IPCMessage):

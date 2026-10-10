@@ -376,3 +376,15 @@ TYPE_ALIAS_WITH_NAMED_EXPRESSION: Final = ErrorMessage(
 TYPE_ALIAS_WITH_AWAIT_EXPRESSION: Final = ErrorMessage(
     "Await expression cannot be used within a type alias", codes.SYNTAX
 )
+
+FUNCTION_WORK_LIMIT_EXCEEDED: Final = ErrorMessage(
+    'Function "{}" was not fully type checked: exceeded the configured per-function '
+    "work limit of {} work units",
+    codes.MISC,
+)
+
+FUNCTION_WORK_LIMIT_NOTE: Final = ErrorMessage(
+    "This function contains overly complex type inference (e.g. deeply nested or "
+    "recursive generics). Simplify it, or increase the limit using --max-function-work "
+    "(0 means no limit)"
+)

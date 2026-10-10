@@ -1,0 +1,171 @@
+# Tests for the recoverable per-function type checking work limit
+# (--max-function-work).
+#
+# When checking a function needs more than the configured (deterministic)
+# number of work units, the function is reported as not fully checked, checker
+# state is rolled back, and checking continues with other functions. The
+# decision must be identical in serial and parallel mode, and partially
+# checked modules must not be cached.
+
+-- R1: the function that exhausts the limit gets a diagnostic that locates
+-- it precisely. R2: later independent functions are still fully checked and
+-- their errors are reported.
+[case testFunctionWorkLimitExhaustedReportsAndContinues]
+# flags: --max-function-work=50
+from typing import Generic, TypeVar, Union
+T = TypeVar("T")
+class Box(Generic[T]):
+    def __init__(self, x: T) -> None:
+        self.x = x
+
+def heavy(u: Union[int, str, None]) -> None:
+    a = Box(u)
+    b = Box(a)
+    c = Box(b)
+    d = Box(c)
+    e = Box(d)
+    f = Box(e)
+    reveal_type(f)
+
+def later_ok(x: int) -> int:
+    return x
+
+def later_bad(x: int) -> str:
+    return x
+[out]
+main:8: error: Function "heavy" was not fully type checked: exceeded the configured per-function work limit of 50 work units
+main:8: note: This function contains overly complex type inference (e.g. deeply nested or recursive generics). Simplify it, or increase the limit using --max-function-work (0 means no limit)
+main:21: error: Incompatible return value type (got "int", expected "str")
+
+[case testFunctionWorkLimitExhaustedReportsAndContinuesParallel]
+# flags: --max-function-work=50 --num-workers=2
+from typing import Generic, TypeVar, Union
+T = TypeVar("T")
+class Box(Generic[T]):
+    def __init__(self, x: T) -> None:
+        self.x = x
+
+def heavy(u: Union[int, str, None]) -> None:
+    a = Box(u)
+    b = Box(a)
+    c = Box(b)
+    d = Box(c)
+    e = Box(d)
+    f = Box(e)
+    reveal_type(f)
+
+def later_ok(x: int) -> int:
+    return x
+
+def later_bad(x: int) -> str:
+    return x
+[out]
+main:8: error: Function "heavy" was not fully type checked: exceeded the configured per-function work limit of 50 work units
+main:8: note: This function contains overly complex type inference (e.g. deeply nested or recursive generics). Simplify it, or increase the limit using --max-function-work (0 means no limit)
+main:21: error: Incompatible return value type (got "int", expected "str")
+
+[case testFunctionWorkLimitStateIsolation]
+# flags: --max-function-work=50
+from typing import Generic, TypeVar, Union
+T = TypeVar("T")
+class Box(Generic[T]):
+    def __init__(self, x: T) -> None:
+        self.x = x
+
+def heavy(u: Union[int, str, None]) -> None:
+    a = Box(u)
+    b = Box(a)
+    c = Box(b)
+    d = Box(c)
+    e = Box(d)
+    f = Box(e)
+    reveal_type(f)
+
+def later_generic(u: Union[int, str]) -> None:
+    a = Box(u)
+    reveal_type(a)
+
+def later_bad(x: int) -> str:
+    return x
+[out]
+main:8: error: Function "heavy" was not fully type checked: exceeded the configured per-function work limit of 50 work units
+main:8: note: This function contains overly complex type inference (e.g. deeply nested or recursive generics). Simplify it, or increase the limit using --max-function-work (0 means no limit)
+main:19: note: Revealed type is "__main__.Box[builtins.int | builtins.str]"
+main:22: error: Incompatible return value type (got "int", expected "str")
+
+[case testFunctionWorkLimitStateIsolationBaseline]
+from typing import Generic, TypeVar, Union
+T = TypeVar("T")
+class Box(Generic[T]):
+    def __init__(self, x: T) -> None:
+        self.x = x
+
+def heavy(u: Union[int, str, None]) -> None:
+    a = Box(u)
+    b = Box(a)
+    c = Box(b)
+    d = Box(c)
+    e = Box(d)
+    f = Box(e)
+    reveal_type(f)
+
+def later_generic(u: Union[int, str]) -> None:
+    a = Box(u)
+    reveal_type(a)
+
+def later_bad(x: int) -> str:
+    return x
+[out]
+main:14: note: Revealed type is "__main__.Box[__main__.Box[__main__.Box[__main__.Box[__main__.Box[__main__.Box[builtins.int | builtins.str | None]]]]]]"
+main:18: note: Revealed type is "__main__.Box[builtins.int | builtins.str]"
+main:21: error: Incompatible return value type (got "int", expected "str")
+
+[case testFunctionWorkLimitRollsBackInferredAttributes]
+# flags: --max-function-work=50
+from typing import Generic, TypeVar, Union
+T = TypeVar("T")
+class Box(Generic[T]):
+    def __init__(self, x: T) -> None:
+        self.x = x
+class C:
+    def __init__(self, u: Union[int, str]) -> None:
+        a = Box(u)
+        b = Box(a)
+        c = Box(b)
+        d = Box(c)
+        e = Box(d)
+        self.attr = e
+    def later(self) -> str:
+        return self.attr
+[out]
+main:8: error: Function "__init__" was not fully type checked: exceeded the configured per-function work limit of 50 work units
+main:8: note: This function contains overly complex type inference (e.g. deeply nested or recursive generics). Simplify it, or increase the limit using --max-function-work (0 means no limit)
+main:16: error: Cannot determine type of "attr"
+
+[case testFunctionWorkLimitIncrementalLimitRemovedReusesCache]
+# flags: --max-function-work=50
+# flags2: --max-function-work=0
+from typing import Generic, TypeVar, Union
+T = TypeVar("T")
+class Box(Generic[T]):
+    def __init__(self, x: T) -> None:
+        self.x = x
+
+def heavy(u: Union[int, str, None]) -> None:
+    a = Box(u)
+    b = Box(a)
+    c = Box(b)
+    d = Box(c)
+    e = Box(d)
+    f = Box(e)
+    reveal_type(f)
+
+def later_bad(x: int) -> str:
+    return x
+[out]
+main:9: error: Function "heavy" was not fully type checked: exceeded the configured per-function work limit of 50 work units
+main:9: note: This function contains overly complex type inference (e.g. deeply nested or recursive generics). Simplify it, or increase the limit using --max-function-work (0 means no limit)
+main:19: error: Incompatible return value type (got "int", expected "str")
+[out2]
+main:16: note: Revealed type is "__main__.Box[__main__.Box[__main__.Box[__main__.Box[__main__.Box[__main__.Box[builtins.int | builtins.str | None]]]]]]"
+main:19: error: Incompatible return value type (got "int", expected "str")

@@ -63,7 +63,7 @@ from __future__ import annotations
 import itertools
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Set as AbstractSet
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from typing import (
     Final,
     Generic,
@@ -80,7 +80,7 @@ import mypy.checkexpr
 from mypy import errorcodes as codes, join, message_registry, nodes, operators
 from mypy.binder import ConditionalTypeBinder, Frame, get_declaration
 from mypy.checker_shared import CheckerScope, TypeCheckerSharedApi, TypeRange
-from mypy.checker_state import checker_state
+from mypy.checker_state import FunctionWorkLimitExhausted, checker_state
 from mypy.checkmember import (
     MemberContext,
     analyze_class_attribute_access,
@@ -215,6 +215,7 @@ from mypy.patterns import AsPattern, StarredPattern
 from mypy.plugin import Plugin
 from mypy.plugins import dataclasses as dataclasses_plugin
 from mypy.scope import Scope
+from mypy.typestate import type_state
 from mypy.semanal import is_trivial_body, refers_to_fullname, set_callable_name
 from mypy.semanal_enum import ENUM_BASES, ENUM_SPECIAL_PROPS
 from mypy.semanal_shared import SemanticAnalyzerCoreInterface
@@ -440,6 +441,15 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
     # Have we deferred the current function? If yes, don't infer additional
     # types during this pass within the function.
     current_node_deferred = False
+    # Deterministic type checking work already spent on the function items
+    # currently being checked (one entry per nested check_func_item call).
+    # Empty outside of function bodies.
+    function_work_used: list[int]
+    # Per-function snapshots of attribute Vars whose type was inferred, used to
+    # roll back partial inferences when the function work limit is exhausted.
+    _inferred_attr_scopes: list[dict[Var, tuple[Type | None, bool, bool]]]
+    # Functions that were abandoned because they exhausted the work limit.
+    incomplete_functions: list[FuncItem]
     # Is this file a typeshed stub?
     is_typeshed_stub = False
     options: Options
@@ -507,6 +517,9 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         self.module_refs = set()
         self.pass_num = 0
         self.current_node_deferred = False
+        self.function_work_used = []
+        self._inferred_attr_scopes = []
+        self.incomplete_functions = []
         self.is_stub = tree.is_stub
         self.is_typeshed_stub = tree.is_typeshed_file(options)
         self.inferred_attribute_types = None
@@ -580,6 +593,9 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         self.inferred_attribute_types = None
         self.scope = CheckerScope(self.tree)
         self.globals_unreachable.clear()
+        self.function_work_used = []
+        self._inferred_attr_scopes = []
+        self.incomplete_functions = []
 
     def mark_unreachable(self, block: list[Statement], after: Statement) -> None:
         """Marks all statements in block after a given one (inclusive) as unreachable."""
@@ -773,8 +789,29 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         else:
             self.msg.cannot_determine_type(name, context)
 
+    def charge_work(self, amount: int = 1) -> None:
+        """Account for a deterministic unit of type checking work.
+
+        This is called from statement/expression checking, constraint inference
+        and subtyping. The accounting only happens while a function body is being
+        checked and a per-function work limit is configured. The work counters
+        are per function and are incremented at algorithmic entry points before
+        any cache lookups, so the limit decision does not depend on timing or on
+        cross-function cache state (it is the same in serial and parallel mode).
+        """
+        stack = self.function_work_used
+        if not stack:
+            # Stack is only populated while checking a function body when a
+            # per-function work limit is configured, so this is the common path.
+            return
+        used = stack[-1] + amount
+        stack[-1] = used
+        if used > self.options.max_function_work:
+            raise FunctionWorkLimitExhausted(used, self.options.max_function_work)
+
     def accept(self, stmt: Statement) -> None:
         """Type check a node in the given type context."""
+        self.charge_work()
         try:
             stmt.accept(self)
         except Exception as err:
@@ -1347,8 +1384,8 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
     def visit_func_def_impl(self, defn: FuncDef) -> None:
         with self.tscope.function_scope(defn), self.set_recurse_into_functions():
-            self.check_func_item(defn, name=defn.name)
-            if not self.can_skip_diagnostics:
+            complete = self.check_func_item(defn, name=defn.name)
+            if complete and not self.can_skip_diagnostics:
                 if defn.info:
                     if not defn.is_overload and not defn.is_decorated:
                         # If the definition is the implementation for an
@@ -1366,34 +1403,172 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         type_override: CallableType | None = None,
         name: str | None = None,
         allow_empty: bool = False,
-    ) -> None:
+    ) -> bool:
         """Type check a function.
 
         If type_override is provided, use it as the function type.
+
+        Return True if the function was checked completely, and False if its
+        per-function work limit was exhausted. In the latter case a diagnostic
+        is reported and checking can continue with other functions, while all
+        shared checker state is restored as if the function body had not been
+        entered.
         """
         self.dynamic_funcs.append(defn.is_dynamic() and not type_override)
 
         enclosing_node_deferred = self.current_node_deferred
-        with self.enter_partial_types(is_function=True):
-            typ = self.function_type(defn)
-            if type_override:
-                typ = type_override.copy_modified(line=typ.line, column=typ.column)
-            if isinstance(typ, CallableType):
-                with self.enter_attribute_inference_context():
-                    self.check_func_def(defn, typ, name, allow_empty)
-            else:
-                raise RuntimeError("Not supported")
+        # When no per-function work limit is configured, behave exactly like the
+        # original checker: no counters, no error buffering, no snapshots.
+        limit = self.options.max_function_work
+        limit_active = bool(limit)
+        if limit_active:
+            self.function_work_used.append(0)
+            self._inferred_attr_scopes.append({})
+            snapshot = self._snapshot_function_check_state()
+            # Buffer diagnostics produced while checking the body. If the work
+            # limit is exhausted, half-finished inference may have produced bogus
+            # messages; they are dropped and only the explicit "not fully checked"
+            # diagnostic is reported. On success the buffered messages are replayed.
+            watcher = ErrorWatcher(
+                self.msg.errors, filter_errors=True, save_filtered_errors=True
+            )
+            import os as _os, sys as _sys
+            if _os.environ.get("WLDEBUG"):
+                if "_WL_SEQ" not in globals():
+                    globals()["_WL_SEQ"] = 0
+                globals()["_WL_SEQ"] += 1
+                watcher._wl_seq = globals()["_WL_SEQ"]
+                print(
+                    f"WLDEBUG create watcher seq={watcher._wl_seq} "
+                    f"defn={type(defn).__name__} line={defn.line}",
+                    file=_sys.stderr,
+                )
+        complete = True
+        try:
+            error_watcher = watcher if limit_active else nullcontext()
+            with error_watcher, self.enter_partial_types(is_function=True):
+                typ = self.function_type(defn)
+                if type_override:
+                    typ = type_override.copy_modified(line=typ.line, column=typ.column)
+                if isinstance(typ, CallableType):
+                    with self.enter_attribute_inference_context():
+                        self.check_func_def(defn, typ, name, allow_empty)
+                else:
+                    raise RuntimeError("Not supported")
+        except FunctionWorkLimitExhausted as err:
+            # Restore all shared state that may have been left half-updated by
+            # the interrupted inference, so that other functions are checked as
+            # if the interrupted function was never entered.
+            self._restore_function_check_state(snapshot)
+            self._rollback_inferred_attributes()
+            self.incomplete_functions.append(defn)
+            self.report_function_work_limit(defn, name, err.limit)
+            complete = False
+        finally:
+            if limit_active:
+                import os as _os, sys as _sys
+                if _os.environ.get("WLDEBUG"):
+                    print(
+                        f"WLDEBUG recurse={self.recurse_into_functions} "
+                        f"{type(defn).__name__} line={defn.line} used={self.function_work_used[-1]} "
+                        f"complete={complete}",
+                        file=_sys.stderr,
+                    )
+                self._inferred_attr_scopes.pop()
+                self.function_work_used.pop()
+            self.dynamic_funcs.pop()
+            self.current_node_deferred = enclosing_node_deferred
 
-        self.dynamic_funcs.pop()
-        self.current_node_deferred = enclosing_node_deferred
+        if complete:
+            if limit_active:
+                self.msg.add_errors(watcher.filtered_errors())
+            if name == "__exit__":
+                self.check__exit__return_type(defn)
+            # TODO: the following logic should move to the dataclasses plugin
+            #  https://github.com/python/mypy/issues/15515
+            if name == "__post_init__":
+                if dataclasses_plugin.is_processed_dataclass(defn.info):
+                    dataclasses_plugin.check_post_init(self, defn, defn.info)
+        return complete
 
-        if name == "__exit__":
-            self.check__exit__return_type(defn)
-        # TODO: the following logic should move to the dataclasses plugin
-        #  https://github.com/python/mypy/issues/15515
-        if name == "__post_init__":
-            if dataclasses_plugin.is_processed_dataclass(defn.info):
-                dataclasses_plugin.check_post_init(self, defn, defn.info)
+    def _snapshot_function_check_state(
+        self,
+    ) -> tuple[ConditionalTypeBinder, int, frozenset[object], int, int, int, int, int, int, int]:
+        return (
+            self.binder,
+            len(self.binder.frames),
+            frozenset(self.binder.declarations),
+            len(self.return_types),
+            len(self.scope.stack),
+            len(self.expr_checker.type_context),
+            len(type_state.inferring),
+            len(type_state._assuming),
+            len(type_state._assuming_proper),
+            len(self._globals_widened_in_func),
+        )
+
+    def _restore_function_check_state(
+        self,
+        snapshot: tuple[
+            ConditionalTypeBinder, int, frozenset[object], int, int, int, int, int, int, int
+        ],
+    ) -> None:
+        (
+            binder,
+            num_frames,
+            declarations,
+            num_return_types,
+            num_scope,
+            num_type_context,
+            num_inferring,
+            num_assuming,
+            num_assuming_proper,
+            num_globals,
+        ) = snapshot
+        if self.binder is not binder:
+            # check_func_def() swaps in a fresh binder per expansion. Abandon it
+            # wholesale rather than risk leaking narrowings from the aborted body.
+            self.binder = binder
+        else:
+            del self.binder.frames[num_frames:]
+            for key in list(self.binder.declarations):
+                if key not in declarations:
+                    del self.binder.declarations[key]
+        del self.return_types[num_return_types:]
+        del self.scope.stack[num_scope:]
+        del self.expr_checker.type_context[num_type_context:]
+        del type_state.inferring[num_inferring:]
+        del type_state._assuming[num_assuming:]
+        del type_state._assuming_proper[num_assuming_proper:]
+        del self._globals_widened_in_func[num_globals:]
+
+    def _rollback_inferred_attributes(self) -> None:
+        """Undo attribute type inferences recorded while checking the function.
+
+        Otherwise e.g. an interrupted ``__init__`` could leak partial attribute
+        types into other functions in the same module (and into the cache).
+        """
+        originals = self._inferred_attr_scopes[-1]
+        for var, (original_type, was_inferred, was_ready) in originals.items():
+            var.type = original_type
+            var.is_inferred = was_inferred
+            var.is_ready = was_ready
+
+    def report_function_work_limit(
+        self, defn: FuncItem, name: str | None, limit: int
+    ) -> None:
+        func_name = name or getattr(defn, "name", None) or "<lambda>"
+        import os as _os, sys as _sys
+        if _os.environ.get("WLDEBUG"):
+            print(f"WLDEBUG report limit func={func_name} line={defn.line}", file=_sys.stderr)
+        self.fail(message_registry.FUNCTION_WORK_LIMIT_EXCEEDED.format(func_name, limit), defn)
+        self.note(message_registry.FUNCTION_WORK_LIMIT_NOTE, defn)
+        if _os.environ.get("WLDEBUG"):
+            print(
+                f"WLDEBUG total messages after fail={self.msg.errors.num_messages()} "
+                f"watchers={[(getattr(w, '_wl_seq', '?'), type(w).__name__) for w in self.msg.errors._watchers]}",
+                file=_sys.stderr,
+            )
 
     def check_func_def_override(self, defn: FuncDef, new_type: FunctionLike) -> None:
         assert defn.original_def is not None
@@ -4777,6 +4952,14 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         refers to the variable (lvalue). If var is None, do nothing.
         """
         if var and not self.current_node_deferred:
+            if self._inferred_attr_scopes and var not in self._inferred_attr_scopes[-1]:
+                # Remember the pre-inference state so that an interrupted function
+                # check can roll attribute inference back to its original state.
+                self._inferred_attr_scopes[-1][var] = (
+                    var.type,
+                    var.is_inferred,
+                    var.is_ready,
+                )
             var.type = type
             var.is_inferred = True
             var.is_ready = True

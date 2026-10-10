@@ -148,6 +148,16 @@ class TypeCheckerSharedApi(CheckerPluginInterface):
         raise NotImplementedError
 
     @abstractmethod
+    def charge_work(self, amount: int = 1) -> None:
+        """Account for a deterministic unit of type checking work.
+
+        Does nothing outside of function bodies or when no per-function work
+        limit is configured. Raises FunctionWorkLimitExhausted when the limit
+        of the currently checked function is exceeded.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     def named_type(self, name: str) -> Instance:
         raise NotImplementedError
 

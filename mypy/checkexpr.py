@@ -15,6 +15,7 @@ import mypy.checker
 import mypy.errorcodes as codes
 from mypy import applytype, erasetype, join, message_registry, nodes, operators, types
 from mypy.argmap import ArgTypeExpander, map_actuals_to_formals, map_formals_to_actuals
+from mypy.checker_state import FunctionWorkLimitExhausted
 from mypy.checker_shared import ExpressionCheckerSharedApi
 from mypy.checkmember import analyze_member_access, has_operator
 from mypy.checkstrformat import StringFormatterChecker
@@ -6164,6 +6165,10 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         is True and this expression is a call, allow it to return None.  This
         applies only to this expression and not any subexpressions.
         """
+        # Account for one expression-checking operation before any cache
+        # lookups, so the per-function work limit decision is independent of
+        # expression cache state (and thus identical in serial/parallel mode).
+        self.chk.charge_work()
         if node in self.type_overrides:
             # This branch is very fast, there is no point timing it.
             return self.type_overrides[node]
@@ -6239,6 +6244,11 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                     typ = self.accept_maybe_cache(node, type_context=type_context)
             else:
                 typ = node.accept(self)  # r-value type, when interpreted as a value expression
+        except FunctionWorkLimitExhausted:
+            # Let the per-function work limit signal reach the function boundary.
+            self.is_callee = old_is_callee
+            self.type_context.pop()
+            raise
         except Exception as err:
             report_internal_error(
                 err, self.chk.errors.file, node.line, self.chk.errors, self.chk.options

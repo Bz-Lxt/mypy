@@ -10,6 +10,21 @@ from mypy.checker_shared import TypeCheckerSharedApi
 # good reason.
 
 
+class FunctionWorkLimitExhausted(BaseException):
+    """Signals that checking the current function exceeded its work limit.
+
+    This inherits from BaseException (rather than Exception) because it must
+    propagate through generic ``except Exception`` blocks in the checker (e.g.
+    the internal error handlers) up to the per-function boundary that reports
+    the function as incompletely checked and continues with other functions.
+    """
+
+    def __init__(self, used: int, limit: int) -> None:
+        self.used = used
+        self.limit = limit
+        super().__init__(f"per-function work limit exhausted: {used} > {limit}")
+
+
 class TypeCheckerState:
     # Wrap this in a class since it's faster that using a module-level attribute.
 

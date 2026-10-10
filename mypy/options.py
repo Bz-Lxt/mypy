@@ -81,6 +81,9 @@ OPTIONS_AFFECTING_CACHE: Final = (
         "untyped_calls_exclude",
         "enable_incomplete_feature",
         "install_types",
+        # The per-function work limit can change which diagnostics are produced,
+        # so cached results must be invalidated when it changes.
+        "max_function_work",
     }
 ) - {"debug_cache"}
 
@@ -423,6 +426,12 @@ class Options:
         self.old_type_inference = False
         # Disable expression cache (for debugging).
         self.disable_expression_cache = False
+        # Maximum amount of type checking work allowed for a single function body.
+        # The work is measured using deterministic counters, so that the limit is
+        # triggered identically in serial and parallel mode. When the limit is hit,
+        # the function is reported as incompletely checked, but checking continues
+        # with other functions. A value of 0 (the default) means no limit.
+        self.max_function_work: int = 0
         # Export line-level, limited, fine-grained dependency information in cache data
         # (undocumented feature).
         self.export_ref_info = False
