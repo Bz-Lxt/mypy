@@ -1346,6 +1346,115 @@ def test_del_local_in_generator() -> None:
     with assertRaises(UnboundLocalError, 'local variable "value" referenced before assignment'):
         list(non_crossing(True))
 
+[case testGeneratorFrameSlotReuseAcrossSuspensions]
+# Values used in non-overlapping phases of a generator share one frame slot,
+# including values whose nominal types differ but have the same representation.
+import sys
+from typing import Iterator
+from testutil import assertRaises
+
+getrefcount = getattr(sys, "getrefcount")
+
+class Boom(Exception):
+    pass
+
+def pointer_phases() -> Iterator[object]:
+    a = [1]
+    yield 0
+    yield a
+    b = "two"
+    yield 1
+    yield b
+    c = {3: 3}
+    yield 2
+    yield c
+
+def int_phases() -> Iterator[int]:
+    a = 10 ** 20
+    yield 0
+    yield a
+    b = 20 ** 20
+    yield 1
+    yield b
+
+def branch_phases(cond: bool) -> Iterator[object]:
+    if cond:
+        left = [1]
+        yield 0
+        yield left
+    else:
+        right = "else"
+        yield 0
+        yield right
+
+def exception_after_first_phase() -> Iterator[object]:
+    a = "first"
+    yield 0
+    yield a
+    raise Boom
+
+def close_between_phases():
+    try:
+        a = [9]
+        yield 0
+        yield a
+        b = "second"
+        yield 1
+        yield b
+    finally:
+        print("finally")
+
+def replace_slot_content() -> Iterator[object]:
+    a = first_obj
+    yield 0
+    yield a
+    b = second_obj
+    yield 1
+    yield b
+
+first_obj = object()
+second_obj = object()
+
+def test_slot_reuse() -> None:
+    assert list(pointer_phases()) == [0, [1], 1, "two", 2, {3: 3}]
+    assert list(int_phases()) == [0, 10 ** 20, 1, 20 ** 20]
+    assert list(branch_phases(True)) == [0, [1]]
+    assert list(branch_phases(False)) == [0, "else"]
+
+    it = exception_after_first_phase()
+    assert next(it) == 0
+    assert next(it) == "first"
+    with assertRaises(Boom):
+        next(it)
+
+    it = close_between_phases()
+    assert next(it) == 0
+    assert next(it) == [9]
+    it.close()
+    it = close_between_phases()
+    assert list(it) == [0, [9], 1, "second"]
+
+    first_refs = getrefcount(first_obj)
+    second_refs = getrefcount(second_obj)
+    it = replace_slot_content()
+    assert next(it) == 0
+    assert getrefcount(first_obj) == first_refs + 1
+    assert getrefcount(second_obj) == second_refs
+    assert next(it) is first_obj
+    # Resuming overwrites the shared slot, releasing the first value and storing the second.
+    assert next(it) == 1
+    assert getrefcount(first_obj) == first_refs
+    assert getrefcount(second_obj) == second_refs + 1
+    assert next(it) is second_obj
+    # Destroying the exhausted generator clears the frame and releases the second value.
+    del it
+    assert getrefcount(second_obj) == second_refs
+    print("ok")
+[out]
+finally
+finally
+ok
+
 [case testYieldFromNativeGeneratorInInterpretedCode]
 from typing import Generator
 

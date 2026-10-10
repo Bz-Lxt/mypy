@@ -18,7 +18,13 @@ from mypyc.common import (
 )
 from mypyc.ir.class_ir import ClassIR
 from mypyc.ir.ops import Assign, GetAttr
-from mypyc.ir.rtypes import RInstance
+from mypyc.ir.rtypes import (
+    RInstance,
+    int_rprimitive,
+    list_rprimitive,
+    object_rprimitive,
+    str_rprimitive,
+)
 from mypyc.test.testutil import build_ir_for_single_file2
 from mypyc.transform.generator_spills import registers_live_across_yield
 
@@ -42,6 +48,16 @@ def promoted_slots(cl: ClassIR) -> set[str]:
 def frame_variables(cl: ClassIR) -> set[str]:
     prefix = generator_frame_attribute_prefix(cl.fullname, is_final_class=cl.is_final_class)
     return {name.removeprefix(prefix) for name in cl.attributes if name.startswith(prefix)}
+
+
+def promoted_frame_attrs(cl: ClassIR) -> dict[str, object]:
+    """All frame attributes created for promoted registers (named and temp)."""
+    prefix = generator_frame_attribute_prefix(cl.fullname, is_final_class=cl.is_final_class)
+    return {
+        name: rtype
+        for name, rtype in cl.attributes.items()
+        if name.startswith(prefix) or name.startswith(TEMP_ATTR_NAME + "3_")
+    }
 
 
 class TestGeneratorSpills(unittest.TestCase):
@@ -203,7 +219,9 @@ def gen() -> Iterator[int]:
         helper = cl.env_user_function
         assert helper is not None
         slots = promoted_slots(cl)
-        assert len(slots) == 2
+        # The saved exception states are needed at different suspensions and
+        # their lifetimes don't overlap, so they share a single frame slot.
+        assert len(slots) == 1
         assert not registers_live_across_yield(helper)
 
     def test_recursive_generator_reference_is_rematerialized(self) -> None:
@@ -223,3 +241,176 @@ def outer(edges: list[list[int]]) -> Any:
         # The recursive reference comes from the closure again on every resume,
         # so it doesn't need a second copy on the generator frame.
         assert "walk" not in frame_variables(cl)
+
+    def test_sequential_locals_share_a_frame_slot(self) -> None:
+        cl = generator_class(
+            """\
+from typing import Iterator
+
+def make_list() -> list[int]: ...
+def make_str() -> str: ...
+
+def gen() -> Iterator[object]:
+    a = make_list()
+    yield 0
+    yield a
+    b = make_str()
+    yield 1
+    yield b
+""",
+            "gen_gen",
+        )
+        attrs = promoted_frame_attrs(cl)
+        # The list and str locals never overlap, so they share one attribute.
+        # The attribute stores values with different nominal types and uses the
+        # generic 'object' representation.
+        assert set(attrs) == {
+            generator_frame_attribute_prefix(cl.fullname, is_final_class=cl.is_final_class) + "a"
+        }
+        assert next(iter(attrs.values())) is object_rprimitive
+
+    def test_overlapping_locals_get_separate_slots(self) -> None:
+        cl = generator_class(
+            """\
+from typing import Iterator
+
+def make_list() -> list[int]: ...
+def make_str() -> str: ...
+def use(value: object) -> None: ...
+
+def gen() -> Iterator[int]:
+    a = make_list()
+    b = make_str()
+    yield 0
+    use(a)
+    use(b)
+""",
+            "gen_gen",
+        )
+        attrs = promoted_frame_attrs(cl)
+        prefix = generator_frame_attribute_prefix(cl.fullname, is_final_class=cl.is_final_class)
+        assert attrs[prefix + "a"] is list_rprimitive
+        assert attrs[prefix + "b"] is str_rprimitive
+
+    def test_different_representations_get_separate_slots(self) -> None:
+        cl = generator_class(
+            """\
+from typing import Iterator
+
+def use(value: object) -> None: ...
+
+def gen() -> Iterator[int]:
+    n = 100
+    yield 0
+    yield n
+    s = "x"
+    yield 1
+    use(s)
+""",
+            "gen_gen",
+        )
+        attrs = promoted_frame_attrs(cl)
+        prefix = generator_frame_attribute_prefix(cl.fullname, is_final_class=cl.is_final_class)
+        assert attrs[prefix + "n"] is int_rprimitive
+        assert attrs[prefix + "s"] is str_rprimitive
+
+    def test_locals_on_exclusive_branches_share_a_slot(self) -> None:
+        cl = generator_class(
+            """\
+from typing import Iterator
+
+def make_list() -> list[int]: ...
+def make_str() -> str: ...
+
+def gen(cond: bool) -> Iterator[object]:
+    if cond:
+        left = make_list()
+        yield 0
+        yield left
+    else:
+        right = make_str()
+        yield 0
+        yield right
+""",
+            "gen_gen",
+        )
+        # Only one of the two branch locals can exist, so they can share storage.
+        names = {name for name in promoted_frame_attrs(cl) if not name.endswith("cond")}
+        assert len(names) == 1
+
+    def test_locals_kept_separate_when_one_is_still_needed(self) -> None:
+        cl = generator_class(
+            """\
+from typing import Iterator
+
+def make_list() -> list[int]: ...
+def make_str() -> str: ...
+def use(value: object) -> None: ...
+
+def gen(cond: bool) -> Iterator[int]:
+    a = make_list()
+    yield 0
+    if cond:
+        b = make_str()
+        yield 1
+        use(a)
+        use(b)
+    else:
+        yield 2
+        use(a)
+""",
+            "gen_gen",
+        )
+        attrs = promoted_frame_attrs(cl)
+        prefix = generator_frame_attribute_prefix(cl.fullname, is_final_class=cl.is_final_class)
+        assert prefix + "a" in attrs
+        assert prefix + "b" in attrs
+
+    def test_exception_handler_keeps_slot_live_values_separate(self) -> None:
+        cl = generator_class(
+            """\
+from typing import Iterator
+
+def make_list() -> list[int]: ...
+def make_str() -> str: ...
+def use(value: object) -> None: ...
+
+def gen() -> Iterator[int]:
+    a = make_list()
+    yield 0
+    try:
+        b = make_str()
+        yield 1
+        use(b)
+    except:
+        use(a)
+""",
+            "gen_gen",
+        )
+        attrs = promoted_frame_attrs(cl)
+        prefix = generator_frame_attribute_prefix(cl.fullname, is_final_class=cl.is_final_class)
+        # The handler can read 'a' after 'b' has been stored, so merging the
+        # slots would let an exception observe the wrong value.
+        assert prefix + "a" in attrs
+        assert prefix + "b" in attrs
+
+    def test_frame_layout_is_deterministic_across_builds(self) -> None:
+        source = """\
+from typing import Iterator
+
+def make_list() -> list[int]: ...
+def make_str() -> str: ...
+
+def gen() -> Iterator[object]:
+    a = make_list()
+    yield 0
+    yield a
+    b = make_str()
+    yield 1
+    yield b
+"""
+        layouts = []
+        for _ in range(2):
+            cl = generator_class(source, "gen_gen")
+            layouts.append(list(promoted_frame_attrs(cl).items()))
+        assert layouts[0] == layouts[1]

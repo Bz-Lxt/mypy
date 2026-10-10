@@ -899,6 +899,7 @@ class GetAttr(RegisterOp):
         borrow: bool = False,
         allow_error_value: bool = False,
         borrow_scope: int = KEEP_ALIVE_SHORT_LIVED,
+        rtype: RType | None = None,
     ) -> None:
         super().__init__(line)
         self.obj = obj
@@ -907,12 +908,16 @@ class GetAttr(RegisterOp):
         assert isinstance(obj.type, RInstance), "Attribute access not supported: %s" % obj.type
         self.class_type = obj.type
         attr_type = obj.type.attr_type(attr)
-        self.type = attr_type
+        # The declared attribute type can differ from the value type when a
+        # private generator-frame slot stores values with different nominal
+        # types that share a single representation. Callers that know the
+        # precise type of the value provide it explicitly.
+        self.type = rtype if rtype is not None else attr_type
         if allow_error_value:
             self.error_kind = ERR_NEVER
-        elif attr_type.error_overlap:
+        elif self.type.error_overlap:
             self.error_kind = ERR_MAGIC_OVERLAPPING
-        self.is_borrowed = borrow and attr_type.is_refcounted
+        self.is_borrowed = borrow and self.type.is_refcounted
         # How long a borrowed result of this op stays valid (a KEEP_ALIVE_* constant).
         self.borrow_scope = borrow_scope
 

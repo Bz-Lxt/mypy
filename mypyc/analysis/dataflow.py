@@ -528,6 +528,22 @@ def analyze_live_regs_with_exception_edges(
     raise. This matters when an assignment later in the same block overwrites a
     value that the error handler can still read. Returns inserted for a yield
     are treated as edges to their continuation blocks.
+    """
+    live_in, _ = analyze_live_regs_details_with_exception_edges(blocks)
+    return live_in
+
+
+def analyze_live_regs_details_with_exception_edges(
+    blocks: list[BasicBlock],
+) -> tuple[dict[BasicBlock, set[Value]], AnalysisDict[Value]]:
+    """Like analyze_live_regs_with_exception_edges(), but also expose op-level liveness.
+
+    The second result maps (block, op_index) to the values live immediately after
+    the operation. The error edge of the operation itself is excluded from this
+    set, since a value the error handler needs is read before the operation
+    completes and the defining write doesn't happen on the error path. Error
+    edges of later operations and all control-flow successors are included, as
+    the stored value must still be available if one of them is taken.
 
     TODO: Unlike run_analysis(), this supports edges from the middle of basic
           blocks, so we reimplement data flow analysis here. Figure out a way
@@ -535,6 +551,7 @@ def analyze_live_regs_with_exception_edges(
     """
     visitor = LivenessVisitor()
     live_in: dict[BasicBlock, set[Value]] = {block: set() for block in blocks}
+    live_after: AnalysisDict[Value] = {}
 
     while True:
         changed = False
@@ -549,7 +566,9 @@ def analyze_live_regs_with_exception_edges(
             for successor in successors:
                 live.update(live_in[successor])
 
-            for op in reversed(block.ops):
+            for index in range(len(block.ops) - 1, -1, -1):
+                live_after[block, index] = set(live)
+                op = block.ops[index]
                 if (
                     block.error_handler is not None
                     and isinstance(op, RegisterOp)
@@ -565,7 +584,7 @@ def analyze_live_regs_with_exception_edges(
                 changed = True
 
         if not changed:
-            return live_in
+            return live_in, live_after
 
 
 # Analysis kinds

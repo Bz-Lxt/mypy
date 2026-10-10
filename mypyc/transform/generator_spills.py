@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from mypyc.analysis.dataflow import analyze_live_regs_with_exception_edges, cleanup_cfg
+from mypyc.analysis.dataflow import analyze_live_regs_details_with_exception_edges, cleanup_cfg
 from mypyc.common import TEMP_ATTR_NAME, generator_frame_attribute_prefix
 from mypyc.ir.class_ir import ClassIR
 from mypyc.ir.func_ir import FuncIR
@@ -21,6 +21,7 @@ from mypyc.ir.ops import (
     SetAttr,
     Value,
 )
+from mypyc.ir.rtypes import RType, is_simple_refcounted_pointer, object_rprimitive
 from mypyc.namegen import exported_name
 
 
@@ -30,12 +31,14 @@ def promote_generator_registers(ir: FuncIR, frame: ClassIR) -> None:
     This runs before uninitialized-value, exception, and refcount transforms.
     """
     cleanup_cfg(ir.blocks)
-    registers = registers_live_across_yield(ir)
+    nullable = nullable_registers(ir.blocks)
+    live_in, live_after = analyze_live_regs_details_with_exception_edges(ir.blocks)
+    registers = promotable_registers(ir.blocks, live_in[ir.blocks[0]])
     if not registers:
         return
 
-    nullable = nullable_registers(ir.blocks)
-    slots = allocate_slots(frame, registers)
+    interference = register_interference(registers, live_after)
+    slots = allocate_slots(frame, registers, interference)
     rewrite_registers(ir.blocks, ir.arg_regs[0], slots, nullable)
 
     # Keep this close to the rewrite: it catches a new op kind that is not
@@ -48,14 +51,47 @@ def promote_generator_registers(ir: FuncIR, frame: ClassIR) -> None:
 
 def registers_live_across_yield(ir: FuncIR) -> list[Register]:
     """Return promotable registers live at generator-helper entry."""
-    live_in = analyze_live_regs_with_exception_edges(ir.blocks)
-    excluded = unpromotable_registers(ir.blocks)
+    live_in, _ = analyze_live_regs_details_with_exception_edges(ir.blocks)
+    return promotable_registers(ir.blocks, live_in[ir.blocks[0]])
+
+
+def promotable_registers(blocks: list[BasicBlock], live: set[Value]) -> list[Register]:
+    """Select promotable registers from a live set and order them deterministically."""
+    excluded = unpromotable_registers(blocks)
     registers = [
         value
-        for value in live_in[ir.blocks[0]]
+        for value in live
         if isinstance(value, Register) and not value.is_arg and value not in excluded
     ]
-    return order_registers(registers, ir.blocks)
+    return order_registers(registers, blocks)
+
+
+def register_interference(
+    registers: list[Register], live_after: dict[tuple[BasicBlock, int], set[Value]]
+) -> dict[Register, set[Register]]:
+    """Build the interference graph of registers that need distinct frame slots.
+
+    A register defined at an operation interferes with every register live after
+    that operation, including across branches, error edges and yield
+    continuations (all already present in live_after). Two registers sharing a
+    slot without an edge between them can never observe each other's stored
+    value, so reusing the storage is safe through errors, generator close and
+    early completion.
+    """
+    candidates = set(registers)
+    edges: dict[Register, set[Register]] = {register: set() for register in registers}
+    for (block, index), live in live_after.items():
+        op = block.ops[index]
+        if not isinstance(op, Assign) or not isinstance(op.dest, Register):
+            continue
+        dest = op.dest
+        if dest not in candidates:
+            continue
+        for register in live:
+            if register is not dest and isinstance(register, Register) and register in candidates:
+                edges[dest].add(register)
+                edges[register].add(dest)
+    return edges
 
 
 def unpromotable_registers(blocks: list[BasicBlock]) -> set[Register]:
@@ -111,23 +147,79 @@ def order_registers(registers: list[Register], blocks: list[BasicBlock]) -> list
     return sorted(registers, key=positions.__getitem__)
 
 
-def allocate_slots(frame: ClassIR, registers: list[Register]) -> dict[Register, str]:
-    slots: dict[Register, str] = {}
+def can_share_slot_type(left: RType, right: RType) -> bool:
+    """Check whether two values can be stored in the same frame attribute.
+
+    Identical representations always match. Distinct types can share one
+    'PyObject *' field, since the storage layout, ownership rules and the NULL
+    undefined/error value are identical for every reference-counted pointer.
+    Other unboxed representations (tagged ints, floats, bools, inline tuples)
+    keep separate slots.
+    """
+    if left == right:
+        return True
+    return is_simple_refcounted_pointer(left) and is_simple_refcounted_pointer(right)
+
+
+class FrameSlot:
+    """A frame attribute shared by one or more non-interfering registers."""
+
+    def __init__(self, first: Register, index: int) -> None:
+        self.members = [first]
+        self.index = index
+        self.type = first.type
+
+    def can_add(self, register: Register, interference: dict[Register, set[Register]]) -> bool:
+        if not can_share_slot_type(self.type, register.type):
+            return False
+        return all(register not in interference[member] for member in self.members)
+
+    def add(self, register: Register) -> None:
+        self.members.append(register)
+        if self.type != register.type:
+            # The members agree on a single, reference-counted 'PyObject *'
+            # representation, so the shared field uses the generic type.
+            assert is_simple_refcounted_pointer(self.type)
+            assert is_simple_refcounted_pointer(register.type)
+            self.type = object_rprimitive
+
+
+def allocate_slots(
+    frame: ClassIR, registers: list[Register], interference: dict[Register, set[Register]]
+) -> dict[Register, str]:
+    """Assign registers to frame attributes, reusing slots when safe.
+
+    Registers are processed in deterministic first-appearance order and placed
+    into the earliest compatible slot, so frame layouts for identical input are
+    stable across compilations.
+    """
     owner = exported_name(frame.fullname)
     source_prefix = generator_frame_attribute_prefix(
         frame.fullname, is_final_class=frame.is_final_class
     )
-    for index, register in enumerate(registers):
-        if register.name:
-            name = available_attr_name(frame, source_prefix + register.name)
+    groups: list[FrameSlot] = []
+    for register in registers:
+        for slot in groups:
+            if slot.can_add(register, interference):
+                slot.add(register)
+                break
         else:
-            name = f"{TEMP_ATTR_NAME}3_{owner}_{index}"
-            if register.type.error_overlap:
+            groups.append(FrameSlot(register, len(groups)))
+
+    slots: dict[Register, str] = {}
+    for slot in groups:
+        first = slot.members[0]
+        if first.name:
+            name = available_attr_name(frame, source_prefix + first.name)
+        else:
+            name = f"{TEMP_ATTR_NAME}3_{owner}_{slot.index}"
+            if all(not member.name and slot.type.error_overlap for member in slot.members):
                 # Compiler temporaries are assigned before use. Recording a
                 # default avoids allocating an undefinedness bitmap for them.
                 frame.attrs_with_defaults.add(name)
-        frame.attributes[name] = register.type
-        slots[register] = name
+        frame.attributes[name] = slot.type
+        for member in slot.members:
+            slots[member] = name
     return slots
 
 
@@ -163,6 +255,7 @@ def rewrite_registers(
                             frame_reg,
                             slots[source],
                             source_line(op, source),
+                            rtype=source.type,
                             allow_error_value=source in nullable,
                         )
                         block.ops.append(read)
