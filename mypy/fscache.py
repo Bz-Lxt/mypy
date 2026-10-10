@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import os
 import stat
+import time
+from collections.abc import Mapping, Set as AbstractSet
 
 from mypy_extensions import mypyc_attr
 
@@ -44,6 +46,11 @@ class FileSystemCache:
         # The package root is not flushed with the caches.
         # It is set by set_package_root() below.
         self.package_root: list[str] = []
+        # Transient in-memory file system overlay used for tentative daemon
+        # checks of unsaved editor buffers. None means no overlay is active.
+        # See begin_virtual()/end_virtual() below.
+        self.virtual_files: dict[str, bytes] | None = None
+        self.virtual_removed: frozenset[str] = frozenset()
         self.flush()
 
     def set_package_root(self, package_root: list[str]) -> None:
@@ -62,9 +69,64 @@ class FileSystemCache:
         self.hash_cache: dict[str, str] = {}
         self.fake_package_cache: set[str] = set()
 
+    def begin_virtual(
+        self, files: Mapping[str, bytes], removed: AbstractSet[str] = frozenset()
+    ) -> None:
+        """Install a transient in-memory overlay of file contents.
+
+        While the overlay is active, all file system reads through this
+        cache behave as if each path in ``files`` had the given contents
+        (regardless of what is on disk, or even if the path doesn't exist
+        on disk at all), and as if each path in ``removed`` didn't exist.
+        Nothing is written to disk. Use end_virtual() to revert to the real
+        file system state.
+
+        This is used by the daemon to tentatively check unsaved editor
+        buffers.
+        """
+        self.virtual_files = {os.path.normpath(path): data for path, data in files.items()}
+        self.virtual_removed = frozenset(os.path.normpath(path) for path in removed)
+        # Start a new transaction so that no cached real state shadows the
+        # overlay.
+        self.flush()
+
+    def end_virtual(self) -> None:
+        """Remove an overlay installed by begin_virtual(), if any."""
+        self.virtual_files = None
+        self.virtual_removed = frozenset()
+        self.flush()
+
+    def _virtual_stat(self, path: str, data: bytes) -> os.stat_result:
+        """Synthesize a stat result for a file that only exists in the overlay."""
+        # Borrow the metadata of the containing directory (device, owner,
+        # etc.) so that the fake result looks plausible. Overwrite the fields
+        # that describe a regular file. The mtime is fixed for the duration of
+        # the overlay and differs (almost surely) from that of any real file.
+        virtual_mtime = time.time()
+        seq: list[float] = list(os.stat(os.path.dirname(path) or "."))
+        seq[stat.ST_MODE] = stat.S_IFREG | 0o644
+        seq[stat.ST_INO] = 1
+        seq[stat.ST_NLINK] = 1
+        seq[stat.ST_SIZE] = len(data)
+        seq[stat.ST_ATIME] = virtual_mtime
+        seq[stat.ST_MTIME] = virtual_mtime
+        seq[stat.ST_CTIME] = virtual_mtime
+        return os.stat_result(seq)
+
     def stat_or_none(self, path: str) -> os.stat_result | None:
+        path = os.path.normpath(path)
         if path in self.stat_or_none_cache:
             return self.stat_or_none_cache[path]
+
+        if self.virtual_files is not None:
+            if path in self.virtual_removed:
+                self.stat_or_none_cache[path] = None
+                return None
+            virtual_data = self.virtual_files.get(path)
+            if virtual_data is not None:
+                st = self._virtual_stat(path, virtual_data)
+                self.stat_or_none_cache[path] = st
+                return st
 
         st = None
         try:
@@ -175,6 +237,19 @@ class FileSystemCache:
             # Like above, take a copy to reduce memory use.
             self.listdir_error_cache[path] = copy_os_error(err)
             raise err
+        if self.virtual_files is not None:
+            # Reflect virtually added and virtually removed files.
+            results = [
+                name
+                for name in results
+                if os.path.normpath(os.path.join(path, name)) not in self.virtual_removed
+            ]
+            present = set(results)
+            for virtual_path in self.virtual_files:
+                dirname, basename = os.path.split(virtual_path)
+                if dirname == path and basename not in present:
+                    results.append(basename)
+                    present.add(basename)
         self.listdir_cache[path] = results
         # Check the fake cache.
         if path in self.fake_package_cache and "__init__.py" not in results:
@@ -263,10 +338,20 @@ class FileSystemCache:
         return True
 
     def read(self, path: str) -> bytes:
+        path = os.path.normpath(path)
+        if self.virtual_files is not None and path in self.virtual_removed:
+            # Mirror the OSError raised by open() for a missing file.
+            raise FileNotFoundError(2, "No such file or directory", path)
         if path in self.read_cache:
             return self.read_cache[path]
         if path in self.read_error_cache:
             raise self.read_error_cache[path]
+
+        if self.virtual_files is not None and path in self.virtual_files:
+            data = self.virtual_files[path]
+            self.read_cache[path] = data
+            self.hash_cache[path] = hash_digest(data)
+            return data
 
         # Need to stat first so that the contents of file are from no
         # earlier instant than the mtime reported by self.stat().

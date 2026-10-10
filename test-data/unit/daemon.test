@@ -247,6 +247,91 @@ import bar
 [file bar.py]
 pass
 
+[case testDaemonTentativeRecheckModifyRollsBack]
+$ dmypy start -- --follow-imports=error --no-error-summary
+Daemon started
+$ dmypy check a.py b.py
+$ {python} -c "from mypy.dmypy.client import request as r;import sys;x=r('.dmypy.json','tentative_recheck',export_types=False,update=[['b.py','def f() -> int:\n    return object()\n']]);sys.stdout.write(x['out']);sys.exit(x['status'])"
+b.py:2: error: Incompatible return value type (got "object", expected "int")  [return-value]
+== Return code: 1
+$ {python} -c "import sys;sys.stdout.write(open('b.py').read())"
+def f() -> int:
+    return 1
+$ dmypy recheck
+$ dmypy stop
+Daemon stopped
+[file a.py]
+from b import f
+x: int = f()
+[file b.py]
+def f() -> int:
+    return 1
+
+[case testDaemonTentativeRecheckSyntaxErrorRollsBack]
+$ dmypy start -- --follow-imports=error --no-error-summary
+Daemon started
+$ dmypy check a.py b.py
+$ {python} -c "from mypy.dmypy.client import request as r;import sys;x=r('.dmypy.json','tentative_recheck',export_types=False,update=[['b.py','def broken(:\n    pass\n']]);sys.stdout.write(x['out']);sys.exit(x['status'])"
+b.py:1: error: Expected a parameter or the end of the parameter list  [syntax]
+b.py:1: error: Expected `)`, found newline  [syntax]
+== Return code: 1
+$ dmypy recheck
+$ {python} -c "from mypy.dmypy.client import request as r;import sys;x=r('.dmypy.json','tentative_recheck',export_types=False,update=[['a.py','from b import f\nx: str = f()\n']]);sys.stdout.write(x['out']);sys.exit(x['status'])"
+a.py:2: error: Incompatible types in assignment (expression has type "int", variable has type "str")  [assignment]
+== Return code: 1
+$ dmypy recheck
+$ dmypy stop
+Daemon stopped
+[file a.py]
+from b import f
+x: int = f()
+[file b.py]
+def f() -> int:
+    return 1
+
+[case testDaemonTentativeRecheckBatchAddOrderIndependent]
+$ dmypy start -- --follow-imports=error --no-error-summary
+Daemon started
+$ dmypy check a.py b.py
+$ {python} -c "from mypy.dmypy.client import request as r;import sys;x=r('.dmypy.json','tentative_recheck',export_types=False,update=[['a.py','from b import f\nfrom c import g\nx: int = f()\ny: int = g()\n'],['b.py','def f() -> str:\n    return str(1)\n'],['c.py','def g() -> str:\n    return str(2)\n']]);sys.stdout.write(x['out']);sys.exit(x['status'])"
+a.py:3: error: Incompatible types in assignment (expression has type "str", variable has type "int")  [assignment]
+a.py:4: error: Incompatible types in assignment (expression has type "str", variable has type "int")  [assignment]
+== Return code: 1
+$ {python} -c "from mypy.dmypy.client import request as r;import sys;x=r('.dmypy.json','tentative_recheck',export_types=False,update=[['c.py','def g() -> str:\n    return str(2)\n'],['b.py','def f() -> str:\n    return str(1)\n'],['a.py','from b import f\nfrom c import g\nx: int = f()\ny: int = g()\n']]);sys.stdout.write(x['out']);sys.exit(x['status'])"
+a.py:3: error: Incompatible types in assignment (expression has type "str", variable has type "int")  [assignment]
+a.py:4: error: Incompatible types in assignment (expression has type "str", variable has type "int")  [assignment]
+== Return code: 1
+$ {python} -c "import os;print(os.path.exists('c.py'))"
+False
+$ dmypy recheck
+$ dmypy stop
+Daemon stopped
+[file a.py]
+from b import f
+x: int = f()
+[file b.py]
+def f() -> int:
+    return 1
+
+[case testDaemonTentativeRecheckRemoveRollsBack]
+$ dmypy start -- --follow-imports=error --no-error-summary
+Daemon started
+$ dmypy check a.py b.py
+$ {python} -c "from mypy.dmypy.client import request as r;import sys;x=r('.dmypy.json','tentative_recheck',export_types=False,remove=['b.py'],update=[['a.py','x: int = 1\n']]);sys.stdout.write(x['out']);sys.exit(x['status'])"
+$ {python} -c "from mypy.dmypy.client import request as r;import sys;x=r('.dmypy.json','tentative_recheck',export_types=False,remove=['b.py']);sys.stdout.write(x['out']);sys.exit(x['status'])"
+a.py:1: error: Import of "b" ignored  [misc]
+a.py:1: note: (Using --follow-imports=error, module not passed on command line)
+== Return code: 1
+$ dmypy recheck
+$ dmypy stop
+Daemon stopped
+[file a.py]
+from b import f
+x: int = f()
+[file b.py]
+def f() -> int:
+    return 1
+
 [case testDaemonTimeout]
 $ dmypy start --timeout 1 -- --follow-imports=error
 Daemon started

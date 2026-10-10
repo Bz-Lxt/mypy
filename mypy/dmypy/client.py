@@ -139,6 +139,34 @@ p.add_argument(
 )
 p.add_argument("--remove", metavar="FILE", nargs="*", help="Files to remove from the run")
 
+tentative_recheck_parser = p = subparsers.add_parser(
+    "tentative-recheck",
+    formatter_class=AugmentedHelpFormatter,
+    help="Re-check unsaved in-memory edits without saving them (requires daemon)",
+)
+p.add_argument("-v", "--verbose", action="store_true", help="Print detailed status")
+p.add_argument("--junit-xml", help="Write junit.xml to the given file")
+p.add_argument("--perf-stats-file", help="write performance information to the given file")
+p.add_argument(
+    "--export-types",
+    action="store_true",
+    help="Store types of all expressions in a shared location (useful for inspections)",
+)
+p.add_argument(
+    "--update",
+    metavar=("FILE", "CONTENT"),
+    nargs=2,
+    action="append",
+    help="Unsaved file and its current in-memory contents; may be repeated. "
+    "The file need not exist on disk. The check is rolled back afterwards",
+)
+p.add_argument(
+    "--remove",
+    metavar="FILE",
+    action="append",
+    help="File deleted in memory (still present on disk); may be repeated",
+)
+
 suggest_parser = p = subparsers.add_parser(
     "suggest", help="Suggest a signature or show call sites for a specific function"
 )
@@ -497,6 +525,32 @@ def do_recheck(args: argparse.Namespace) -> None:
         )
     else:
         response = request(args.status_file, "recheck", export_types=args.export_types)
+    t1 = time.time()
+    response["roundtrip_time"] = t1 - t0
+    check_output(response, args.verbose, args.junit_xml, args.perf_stats_file)
+
+
+@action(tentative_recheck_parser)
+def do_tentative_recheck(args: argparse.Namespace) -> None:
+    """Ask the daemon to re-check a batch of unsaved in-memory edits.
+
+    Each --update gives a file path and its current (unsaved) contents; files
+    need not exist on disk. Each --remove names a file that exists on disk but
+    has been deleted in the editor. All edits are checked together as if they
+    had been saved, and the daemon then rolls back to its previous state, so
+    that diagnostics and later incremental checks are unaffected and nothing is
+    written to disk.
+    """
+    if args.update is None and args.remove is None:
+        fail("tentative-recheck requires at least one --update or --remove option")
+    t0 = time.time()
+    response = request(
+        args.status_file,
+        "tentative_recheck",
+        export_types=args.export_types,
+        remove=args.remove,
+        update=args.update,
+    )
     t1 = time.time()
     response["roundtrip_time"] = t1 - t0
     check_output(response, args.verbose, args.junit_xml, args.perf_stats_file)

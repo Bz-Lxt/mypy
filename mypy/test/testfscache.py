@@ -87,6 +87,60 @@ class TestFileSystemCache(unittest.TestCase):
                 # this path is not under the prefix, case difference is fine.
                 assert self.isfile_case(os.path.join(other, "PKG/other_dir.py"))
 
+    def test_virtual_overlay(self) -> None:
+        self.make_file("real.py")
+        with open(os.path.join(self.tempdir, "real.py"), "w") as f:
+            f.write("original")
+        new_path = os.path.join(self.tempdir, "new.py")
+
+        # Plain file system state before any overlay.
+        assert self.fscache.read(os.path.join(self.tempdir, "real.py")) == b"original"
+        assert not self.fscache.isfile(new_path)
+        assert self.fscache.isfile(os.path.join(self.tempdir, "real.py"))
+
+        self.fscache.begin_virtual(
+            {os.path.join(self.tempdir, "real.py"): b"changed", new_path: b"created"},
+            removed={os.path.join(self.tempdir, "gone.py")},
+        )
+        try:
+            assert self.fscache.read(os.path.join(self.tempdir, "real.py")) == b"changed"
+            assert self.fscache.read(new_path) == b"created"
+            assert self.fscache.isfile(new_path)
+            assert not self.fscache.isdir(new_path)
+            assert "new.py" in self.fscache.listdir(self.tempdir)
+            # The virtual creation must not touch disk.
+            assert not os.path.exists(new_path)
+            # The real file is untouched on disk.
+            with open(os.path.join(self.tempdir, "real.py")) as f:
+                assert f.read() == "original"
+        finally:
+            self.fscache.end_virtual()
+
+        # After ending the overlay everything reflects disk again.
+        assert self.fscache.read(os.path.join(self.tempdir, "real.py")) == b"original"
+        assert not self.fscache.isfile(new_path)
+        assert "new.py" not in self.fscache.listdir(self.tempdir)
+
+    def test_virtual_overlay_removed(self) -> None:
+        self.make_file("gone.py")
+        path = os.path.join(self.tempdir, "gone.py")
+        self.fscache.begin_virtual({}, removed={path})
+        try:
+            assert not self.fscache.isfile(path)
+            assert self.fscache.stat_or_none(path) is None
+            assert "gone.py" not in self.fscache.listdir(self.tempdir)
+            try:
+                self.fscache.read(path)
+            except FileNotFoundError:
+                pass
+            else:
+                raise AssertionError("Expected FileNotFoundError")
+            # Disk is untouched.
+            assert os.path.exists(path)
+        finally:
+            self.fscache.end_virtual()
+        assert self.fscache.isfile(path)
+
     def make_file(self, path: str, base: str | None = None) -> None:
         if base is None:
             base = self.tempdir

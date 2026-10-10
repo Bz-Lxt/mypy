@@ -17,7 +17,7 @@ import time
 import traceback
 from collections.abc import Callable, Sequence, Set as AbstractSet
 from contextlib import redirect_stderr, redirect_stdout
-from typing import Any, Final, TypeAlias as _TypeAlias
+from typing import Any, Final, NamedTuple, TypeAlias as _TypeAlias
 
 from librt.base64 import b64encode
 
@@ -167,6 +167,25 @@ def ignore_suppressed_imports(module: str) -> bool:
 ModulePathPair: _TypeAlias = tuple[str, str]
 ModulePathPairs: _TypeAlias = list[ModulePathPair]
 ChangesAndRemovals: _TypeAlias = tuple[ModulePathPairs, ModulePathPairs]
+WatcherSnapshot: _TypeAlias = tuple[set[str], dict[str, FileData | None]]
+
+
+class _FineGrainedStateSnapshot(NamedTuple):
+    """Fine-grained bookkeeping saved around a tentative (in-memory) check.
+
+    The heavy build state (graph, ASTs, type maps) is restored by applying the
+    inverse changes; these small fields are restored verbatim.
+    """
+
+    previous_messages: list[str]
+    previous_targets_with_errors: set[str]
+    previous_modules: dict[str, str]
+    blocking_error: tuple[str, str] | None
+    stale: list[ModulePathPair]
+    triggered: list[str]
+    changed_modules: list[ModulePathPair]
+    updated_modules: list[str]
+    processed_targets: list[str]
 
 
 class Server:
@@ -285,7 +304,7 @@ class Server:
         if method is None:
             return {"error": f"Unrecognized command '{command}'"}
         else:
-            if command not in {"check", "recheck", "run"}:
+            if command not in {"check", "recheck", "run", "tentative_recheck"}:
                 # Only the above commands use some error formatting.
                 del data["is_tty"]
                 del data["terminal_width"]
@@ -419,6 +438,201 @@ class Server:
         self.update_stats(res)
         self.options.export_types = old_export_types
         return res
+
+    def cmd_tentative_recheck(
+        self,
+        is_tty: bool,
+        terminal_width: int,
+        export_types: bool,
+        remove: list[str] | None = None,
+        update: list[list[str]] | None = None,
+    ) -> dict[str, object]:
+        """Re-check unsaved in-memory edits without persisting them.
+
+        This is intended for editors that want to show diagnostics for a group
+        of dirty (not yet saved) buffers.
+
+        ``update`` is a list of ``[path, content]`` pairs describing files that
+        were modified or created in memory, and ``remove`` lists paths of files
+        that were deleted in memory. All edits are applied to the running build
+        atomically for just this one check, so the reported diagnostics are the
+        same that would be produced if all the files were saved at once, and do
+        not depend on the order in which the edits are submitted.
+
+        After the check completes (including when one of the edited files has a
+        syntax/parse error), the build is rolled back to exactly the state it
+        was in before the request: previous diagnostics, blocking-error state,
+        file watcher baselines and all other incremental bookkeeping are
+        restored. Nothing is written to disk at any point.
+        """
+        t0 = time.time()
+        if not self.fine_grained_manager:
+            return {"error": "Command 'tentative recheck' is only valid after a 'check' command"}
+        if self.following_imports():
+            return {"error": "Tentative recheck is not supported with follow_imports=normal"}
+
+        remove_paths = list(remove or [])
+        update_paths: list[str] = []
+        virtual_contents: dict[str, bytes] = {}
+        for raw_pair in update or []:
+            # RPC payloads are arbitrary JSON, so validate the shape at the
+            # boundary even though the parameter annotation is precise.
+            pair: object = raw_pair
+            if (
+                not isinstance(pair, list)
+                or len(pair) != 2
+                or not all(isinstance(item, str) for item in pair)
+            ):
+                return {
+                    "out": "",
+                    "err": "Each update must be a [path, content] pair of strings",
+                    "status": 2,
+                }
+            path, content = pair
+            if path in update_paths or path in remove_paths:
+                return {
+                    "out": "",
+                    "err": f"File {path!r} appears more than once in a tentative recheck",
+                    "status": 2,
+                }
+            update_paths.append(path)
+            virtual_contents[path] = content.encode("utf-8")
+
+        # Only files that still exist on disk can be unsaved-deleted; requests
+        # to remove paths that don't exist are ignored, just like in 'recheck'.
+        # This must be decided *before* installing the overlay.
+        effective_remove = [path for path in remove_paths if self.fscache.isfile(path)]
+
+        if not update_paths and not effective_remove:
+            return {"out": "", "err": "Nothing to tentatively re-check", "status": 2}
+
+        # Sort updates by extension, so *.pyi files are processed first (same
+        # as in cmd_recheck). Processing the whole batch in one increment makes
+        # the result independent of submission order.
+        update_paths.sort(key=lambda f: os.path.splitext(f)[1], reverse=True)
+
+        fgm = self.fine_grained_manager
+        manager = fgm.manager
+        original_sources = self.previous_sources
+        known_paths = {source.path for source in original_sources if source.path}
+
+        disk_exists = {path: True for path in effective_remove}
+        for path in update_paths:
+            disk_exists[path] = self.fscache.isfile(path)
+
+        removals = set(effective_remove)
+        tentative_sources = [
+            source for source in original_sources if source.path and source.path not in removals
+        ]
+        added = [path for path in update_paths if path not in known_paths]
+
+        # Everything that the tentative increment may mutate, so that the
+        # rollback can put it all back verbatim.
+        watcher_snapshot = self.fswatcher.snapshot()
+        bookkeeping = _FineGrainedStateSnapshot(
+            previous_messages=fgm.previous_messages.copy(),
+            previous_targets_with_errors=set(fgm.previous_targets_with_errors),
+            previous_modules=dict(fgm.previous_modules),
+            blocking_error=fgm.blocking_error,
+            stale=list(fgm.stale),
+            triggered=list(fgm.triggered),
+            changed_modules=list(fgm.changed_modules),
+            updated_modules=list(fgm.updated_modules),
+            processed_targets=list(fgm.processed_targets),
+        )
+
+        old_export_types = self.options.export_types
+        self.options.export_types = self.options.export_types or export_types
+        self.fscache.begin_virtual(virtual_contents, removals)
+        res: dict[str, object]
+        try:
+            try:
+                added_sources = create_source_list(added, self.options, self.fscache)
+            except InvalidSourceList as err:
+                res = {"out": "", "err": str(err), "status": 2}
+            else:
+                tentative_sources = tentative_sources + added_sources  # Make a copy!
+                t1 = time.time()
+                manager.log(f"fine-grained increment: cmd_tentative_recheck: {t1 - t0:.3f}s")
+                messages = self.fine_grained_increment(
+                    tentative_sources,
+                    effective_remove,
+                    update_paths,
+                    explicit_export_types=export_types,
+                )
+                # Format the output while the overlay is still active, since
+                # error snippets may read file contents through the fscache.
+                res = self.increment_output(messages, tentative_sources, is_tty, terminal_width)
+            finally:
+                # Roll back unconditionally -- even when the tentative edit had
+                # a syntax/parse error or the check failed unexpectedly.
+                self.rollback_tentative(
+                    original_sources,
+                    watcher_snapshot,
+                    bookkeeping,
+                    effective_remove,
+                    update_paths,
+                    disk_exists,
+                )
+        finally:
+            self.fscache.end_virtual()
+            self.options.export_types = old_export_types
+        return res
+
+    def rollback_tentative(
+        self,
+        original_sources: list[BuildSource],
+        watcher_snapshot: WatcherSnapshot,
+        bookkeeping: _FineGrainedStateSnapshot,
+        remove_paths: list[str],
+        update_paths: list[str],
+        disk_exists: dict[str, bool],
+    ) -> None:
+        """Undo a tentative increment, restoring the pre-existing build state.
+
+        This works by applying the inverse set of changes, reading the real
+        contents back from disk (which the tentative check never modified), and
+        then restoring incremental bookkeeping and watcher baselines verbatim.
+        """
+        assert self.fine_grained_manager is not None
+        fgm = self.fine_grained_manager
+
+        # Forget overlay-serving caches and ASTs parsed from virtual contents.
+        self.fscache.end_virtual()
+        fgm.flush_cache()
+        self.fswatcher.restore(watcher_snapshot)
+
+        # Inverse changes:
+        #  * in-memory created files -> remove
+        #  * in-memory modified files -> re-read from disk
+        #  * in-memory deleted files (still present on disk) -> re-add from disk
+        inverse_remove = [path for path in update_paths if not disk_exists.get(path, False)]
+        inverse_update = [path for path in update_paths if disk_exists.get(path, False)]
+        inverse_update.extend(remove_paths)
+
+        # The restored watcher baseline for these paths matches disk, so a
+        # plain stat() would report no change. Force the paths to look new so
+        # that the rollback increment actually re-processes them.
+        for path in inverse_update:
+            self.fswatcher.set_file_data(path, None)
+
+        if inverse_remove or inverse_update:
+            self.fine_grained_increment(original_sources, inverse_remove, inverse_update)
+
+        # Restore the watcher baseline and all incremental bookkeeping exactly
+        # as they were before the tentative check.
+        self.fswatcher.restore(watcher_snapshot)
+        fgm.previous_messages = bookkeeping.previous_messages
+        fgm.previous_targets_with_errors = bookkeeping.previous_targets_with_errors
+        fgm.previous_modules = bookkeeping.previous_modules
+        fgm.blocking_error = bookkeeping.blocking_error
+        fgm.stale = bookkeeping.stale
+        fgm.triggered = bookkeeping.triggered
+        fgm.changed_modules = bookkeeping.changed_modules
+        fgm.updated_modules = bookkeeping.updated_modules
+        fgm.processed_targets = bookkeeping.processed_targets
+        self.previous_sources = original_sources
+        self.flush_caches()
 
     def check(
         self, sources: list[BuildSource], export_types: bool, is_tty: bool, terminal_width: int

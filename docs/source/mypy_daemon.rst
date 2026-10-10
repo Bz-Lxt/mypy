@@ -97,6 +97,21 @@ require more precise control over the lifetime of the daemon process:
 * ``dmypy status`` checks whether a daemon is running. It prints a
   diagnostic and exits with ``0`` if there is a running daemon.
 
+* ``dmypy tentative-recheck`` previews diagnostics for a batch of unsaved
+  editor buffers. Each ``--update FILE CONTENT`` pair gives a file and its
+  current in-memory contents (the file need not exist on disk), and each
+  ``--remove FILE`` names a file deleted in the editor (but still present on
+  disk); both options may be repeated. The batch is checked atomically, so
+  the diagnostics are identical to saving all the files at once and do not
+  depend on the order in which the edits are given. Only affected modules
+  are re-checked. Once the preview has been generated -- even if one of the
+  buffers contains a syntax error -- the daemon rolls back to its previous
+  diagnostics and incremental state, so subsequent checks behave as if the
+  tentative check never happened. Nothing is written to disk. Editor
+  integrations that use the JSON RPC directly can call the
+  ``tentative_recheck`` command with ``update`` as a list of
+  ``[path, content]`` pairs and ``remove`` as a list of paths.
+
 Use ``dmypy --help`` for help on additional commands and command-line
 options not discussed here, and ``dmypy <command> --help`` for help on
 command-specific options.

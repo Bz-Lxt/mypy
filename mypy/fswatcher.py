@@ -41,8 +41,20 @@ class FileSystemWatcher:
     def dump_file_data(self) -> dict[str, tuple[float, int, str]]:
         return {k: v for k, v in self._file_data.items() if v is not None}
 
-    def set_file_data(self, path: str, data: FileData) -> None:
+    def set_file_data(self, path: str, data: FileData | None) -> None:
         self._file_data[path] = data
+
+    def snapshot(self) -> tuple[set[str], dict[str, FileData | None]]:
+        """Return a deep-ish copy of the watched paths and their file data.
+
+        Pair with restore() to undo watcher changes made by a tentative
+        (in-memory) check.
+        """
+        return set(self._paths), dict(self._file_data)
+
+    def restore(self, snapshot: tuple[set[str], dict[str, FileData | None]]) -> None:
+        """Restore watched paths and file data from a previous snapshot()."""
+        self._paths, self._file_data = set(snapshot[0]), dict(snapshot[1])
 
     def add_watched_paths(self, paths: Iterable[str]) -> None:
         for path in paths:
